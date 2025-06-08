@@ -104,6 +104,7 @@ music_queues = {}
 current_playing = {}  # Trackea la canción actual por servidor
 
 
+
 # --------------------------
 # Clases Principales
 # --------------------------
@@ -113,10 +114,14 @@ class MusicQueue:
         self.queues: Dict[int, Deque] = {}
         self.current: Dict[int, Dict] = {}
         self.disconnect_timers: Dict[int, asyncio.Task] = {}
+        self.locks: Dict[int, asyncio.Lock] = {}
+        self.is_playing: Dict[int, bool] = {}  # Nuevo: estado de reproducción por servidor
 
     def get_queue(self, guild_id: int) -> Deque:
         if guild_id not in self.queues:
             self.queues[guild_id] = deque()
+            self.locks[guild_id] = asyncio.Lock()
+            self.is_playing[guild_id] = False  # Inicializar estado
         return self.queues[guild_id]
 
     def clear(self, guild_id: int):
@@ -124,11 +129,35 @@ class MusicQueue:
             self.queues[guild_id].clear()
         if guild_id in self.current:
             del self.current[guild_id]
+        if guild_id in self.is_playing:
+            self.is_playing[guild_id] = False
 
     async def cancel_disconnect_timer(self, guild_id: int):
         if guild_id in self.disconnect_timers:
-            self.disconnect_timers[guild_id].cancel()
+            try:
+                self.disconnect_timers[guild_id].cancel()
+            except:
+                pass
             del self.disconnect_timers[guild_id]
+
+    async def safe_get_queue(self, guild_id: int) -> Deque:
+        """Obtiene la cola de manera segura usando un lock"""
+        if guild_id not in self.locks:
+            self.locks[guild_id] = asyncio.Lock()
+        async with self.locks[guild_id]:
+            return self.get_queue(guild_id)
+
+    def set_playing(self, guild_id: int, status: bool):
+        """Actualiza el estado de reproducción"""
+        if guild_id not in self.is_playing:
+            self.is_playing[guild_id] = False
+        self.is_playing[guild_id] = status
+
+    def get_playing(self, guild_id: int) -> bool:
+        """Obtiene el estado de reproducción"""
+        return self.is_playing.get(guild_id, False)
+
+music_queue = MusicQueue()
 
 music_queue = MusicQueue()
 
@@ -183,35 +212,39 @@ async def play_next(guild_id: int, error=None):
     
     if error:
         print(f"Error en reproducción: {error}")
+        music_queue.set_playing(guild_id, False)
     
     if not voice_client or not voice_client.is_connected():
+        music_queue.set_playing(guild_id, False)
         return
 
-    # Limpiar canción actual
-    if guild_id in music_queue.current:
-        del music_queue.current[guild_id]
-    
-    # Cancelar cualquier temporizador de desconexión existente
+    # Cancelar cualquier temporizador existente primero
     await music_queue.cancel_disconnect_timer(guild_id)
+
+    # Doble verificación de la cola con delay
+    await asyncio.sleep(1.5)  # Pequeño delay para estabilidad
+    queue = await music_queue.safe_get_queue(guild_id)
     
-    # Obtener la cola de reproducción
-    queue = music_queue.get_queue(guild_id)
-    
-    # Si no hay más canciones en la cola
     if not queue:
-        channel = voice_client.channel
+        music_queue.set_playing(guild_id, False)
         
-        # Solo iniciar temporizador si realmente no hay nada más en cola
-        if guild_id not in music_queue.queues or not music_queue.queues[guild_id]:
+        # Verificación final con otro pequeño delay
+        await asyncio.sleep(1)
+        queue = await music_queue.safe_get_queue(guild_id)
+        if not queue:
+            channel = voice_client.channel
             await channel.send(f"🛑 No hay más canciones en la cola. Me desconectaré en {DISCONNECT_AFTER} segundos...")
             
             async def disconnect_task():
                 try:
                     await asyncio.sleep(DISCONNECT_AFTER)
                     
-                    # Verificar nuevamente que no hayan añadido canciones
-                    if guild_id not in music_queue.queues or not music_queue.queues[guild_id]:
-                        if voice_client.is_connected():
+                    # Última verificación antes de desconectar
+                    current_queue = await music_queue.safe_get_queue(guild_id)
+                    await music_queue.cancel_disconnect_timer(guild_id)
+                    if not current_queue and voice_client.is_connected():
+                        # Verificación final de reproducción
+                        if not voice_client.is_playing():
                             await channel.send("🔌 Desconectando por inactividad...")
                             await voice_client.disconnect()
                 except Exception as e:
@@ -221,11 +254,16 @@ async def play_next(guild_id: int, error=None):
                         del music_queue.disconnect_timers[guild_id]
             
             music_queue.disconnect_timers[guild_id] = asyncio.create_task(disconnect_task())
-        return
+            return
+    
+    # Limpiar canción actual
+    if guild_id in music_queue.current:
+        del music_queue.current[guild_id]
     
     # Reproducir siguiente canción
     next_song = queue.popleft()
     music_queue.current[guild_id] = next_song
+    music_queue.set_playing(guild_id, True)
     
     try:
         # Configuración adaptativa de calidad
@@ -256,10 +294,12 @@ async def play_next(guild_id: int, error=None):
             name=next_song['title'][:50]
         ))
         
-    except Exception:
+    except Exception as e:
         print(f"Error al reproducir: {traceback.format_exc()}")
+        music_queue.set_playing(guild_id, False)
         await asyncio.sleep(2)
         await play_next(guild_id)
+
 
 # ------------------------------------------
 # Comandos de Música
@@ -272,7 +312,7 @@ async def play(ctx, *, query: str):
         return await ctx.send("🚨 Debes estar en un canal de voz para usar este comando!")
 
     try:
-        # Cancelar cualquier temporizador de desconexión existente
+        # Cancelar cualquier temporizador de desconexión primero
         await music_queue.cancel_disconnect_timer(ctx.guild.id)
         
         data = await MusicPlayer.get_audio_source(query)
@@ -281,16 +321,18 @@ async def play(ctx, *, query: str):
 
         voice_client = ctx.voice_client or await ctx.author.voice.channel.connect()
         
-        queue = music_queue.get_queue(ctx.guild.id)
+        # Añadir a la cola de manera segura
+        queue = await music_queue.safe_get_queue(ctx.guild.id)
         queue.append(data)
 
-        if not voice_client.is_playing() and ctx.guild.id not in music_queue.current:
+        # Verificar si debemos empezar a reproducir
+        if not voice_client.is_playing() and not music_queue.get_playing(ctx.guild.id):
             await play_next(ctx.guild.id)
             await ctx.send(f"🎶 **Reproduciendo:** {data['title']}")
         else:
             await ctx.send(f"🎵 **Añadido a la cola:** {data['title']}")
 
-    except Exception:
+    except Exception as e:
         await ctx.send("❌ Error al reproducir")
         print(f"Error en play: {traceback.format_exc()}")
 
@@ -298,19 +340,40 @@ async def play(ctx, *, query: str):
 async def skip(ctx):
     """Salta la canción actual"""
     voice_client = ctx.voice_client
-    if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
+    if not voice_client:
+        return await ctx.send("❌ No estoy conectado a un canal de voz")
+    
+    queue = await music_queue.safe_get_queue(ctx.guild.id)
+    if not queue and not music_queue.get_playing(ctx.guild.id):
+        return await ctx.send("❌ No hay música en la cola")
+    
+    if voice_client.is_playing() or voice_client.is_paused():
+        await ctx.send("⏭️ Saltando canción...")
+        await asyncio.sleep(1.5)
+        await music_queue.cancel_disconnect_timer(ctx.guild.id)  # <-- añadido
         voice_client.stop()
-        await ctx.send("⏭️ Canción saltada")
-        await play_next(ctx.guild.id)
     else:
-        await ctx.send("❌ No hay música reproduciéndose")
+        if queue:
+            await ctx.send("⏭️ Saltando a la siguiente canción...")
+            await music_queue.cancel_disconnect_timer(ctx.guild.id)  # <-- añadido
+            await play_next(ctx.guild.id)
+        else:
+            await ctx.send("❌ No hay música reproduciéndose")
+
 
 @bot.command(name="stop")
 async def stop(ctx):
     """Detiene la música y limpia la cola"""
     voice_client = ctx.voice_client
     if voice_client:
+        # Verificación adicional antes de detener
+        queue = await music_queue.safe_get_queue(ctx.guild.id)
+        if queue:
+            await ctx.send("⚠️ Hay canciones en cola. Usa !skip para saltar o espera a que terminen.")
+            return
+            
         music_queue.clear(ctx.guild.id)
+        await music_queue.cancel_disconnect_timer(ctx.guild.id)
         if voice_client.is_playing():
             voice_client.stop()
         await voice_client.disconnect()
@@ -369,10 +432,14 @@ async def resume(ctx):
 @bot.command(name="nowplaying", aliases=["np"])
 async def nowplaying(ctx):
     """Muestra la canción actual"""
-    if ctx.guild.id in current_playing:
-        await ctx.send(f"🎶 Reproduciendo ahora: {current_playing[ctx.guild.id]['title']}")
+    if ctx.guild.id in music_queue.current:
+        await ctx.send(f"🎶 Reproduciendo ahora: {music_queue.current[ctx.guild.id]['title']}")
     else:
-        await ctx.send("❌ No hay música reproduciéndose")
+        queue = await music_queue.safe_get_queue(ctx.guild.id)
+        if queue:
+            await ctx.send("⏸️ Hay música en cola pero no se está reproduciendo actualmente")
+        else:
+            await ctx.send("❌ No hay música reproduciéndose o en cola")
 
 @bot.command()
 async def latency(ctx):
@@ -384,8 +451,8 @@ async def latency(ctx):
     if ctx.voice_client:
         content += f" | Voz: {int(ctx.voice_client.latency*1000)}ms"
     await message.edit(content=content)
-    
-    
+
+
 # Constantes de configuración
 STAFF_ROLES = [1380930376343752704, 1380930523668549703, 1380930573899665538, 1380930606191607949]
 LOG_CHANNEL_ID = 1381026786368032819
@@ -823,6 +890,7 @@ async def on_voice_state_update(member, before, after):
     
     if before.channel and not after.channel:
         music_queue.clear(before.channel.guild.id)
+        await music_queue.cancel_disconnect_timer(before.channel.guild.id)
     elif before.channel and after.channel and before.channel != after.channel:
         await after.channel.send("🔊 Me han movido a este canal de voz")
 
@@ -840,5 +908,4 @@ async def on_ready():
 # Ejecución del Bot
 # --------------------------
 
-bot.run(os.getenv("TOKEN"))
 bot.run(os.getenv("TOKEN"))
