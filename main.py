@@ -1,21 +1,338 @@
 import discord
 from discord import app_commands, ui
-from discord.ext import commands
+from discord.ext import commands, tasks
 import os
 import asyncio
 from dotenv import load_dotenv
 from datetime import datetime
 import sqlite3
+import yt_dlp
+from collections import deque
+import time
+import traceback
+import subprocess
 
 # Configuración inicial
 load_dotenv()
-
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# ------------------------------------------
+# Configuración del Sistema de Música
+# ------------------------------------------
+
+# Configuración optimizada de FFmpeg
+DISCONNECT_AFTER = 60
+
+FFMPEG_OPTIONS = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -probesize 32M -analyzeduration 32M',
+    'options': '-vn -c:a libopus -b:a 128k -ar 48000 -ac 2 -filter:a "volume=0.8"',
+    'executable': 'ffmpeg',  # Asegúrate de que FFmpeg esté en tu PATH
+}
+
+# Calidades de audio disponibles
+AUDIO_QUALITIES = {
+    'low': {'bitrate': '64k', 'options': '-vn -af "volume=0.9"'},
+    'medium': {'bitrate': '128k', 'options': '-vn -af "dynaudnorm=f=150:g=15"'},
+    'high': {'bitrate': '192k', 'options': '-vn -ar 48000 -ac 2 -af "dynaudnorm=f=150:g=15"'}
+}
+
+ydl_opts = {
+    'format': 'bestaudio/best',
+    'quiet': True,
+    'no_warnings': True,
+    'noplaylist': True,
+    'socket_timeout': 5,
+    'source_address': '0.0.0.0',
+    'force-ipv4': True,
+    'extractor_args': {
+        'youtube': {
+            'player_skip': ['js'],
+            'skip': ['hls', 'dash', 'translated_subs']
+        }
+    },
+    'postprocessor_args': {
+        'key': 'FFmpegExtractAudio',
+        'preferredcodec': 'opus',
+        'preferredquality': '192',
+    }
+}
+
+# Sistema de colas por servidor
+music_queues = {}
+current_playing = {}  # Trackea la canción actual por servidor
+
+class MusicPlayer:
+    @staticmethod
+    async def get_audio_source(query: str):
+        """Obtiene información del audio desde YouTube"""
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'quiet': True,
+            'no_warnings': True,
+            'extractaudio': True,
+            'audioformat': 'mp3',
+            'noplaylist': True,
+            'socket_timeout': 5,
+            'source_address': '0.0.0.0',
+            'force-ipv4': True,
+            'cachedir': False,
+            'extractor_args': {
+                'youtube': {
+                    'player_skip': ['configs', 'webpage'],
+                    'skip': ['hls', 'dash', 'translated_subs']
+                }
+            },
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
+        }
+        
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # Si no es una URL, buscar como consulta
+                if not query.startswith(('http://', 'https://')):
+                    query = f"ytsearch:{query}"
+                
+                info = await bot.loop.run_in_executor(None, lambda: ydl.extract_info(query, download=False))
+                
+                if 'entries' in info:
+                    info = info['entries'][0]
+                
+                return {
+                    'url': info['url'],
+                    'title': info.get('title', 'Audio desconocido'),
+                    'duration': info.get('duration', 0)
+                }
+        except Exception as e:
+            print(f"Error al obtener audio: {traceback.format_exc()}")
+            return None
+
+async def play_next(guild_id: int, error=None):
+    voice_client = discord.utils.get(bot.voice_clients, guild=bot.get_guild(guild_id))
+    
+    # Verificar si hay un error previo
+    if error:
+        print(f"Error en reproducción: {error}")
+    
+    # Si no hay cliente de voz o no está conectado, salir
+    if not voice_client or not voice_client.is_connected():
+        return
+
+    # Limpiar canción actual si existe
+    if guild_id in current_playing:
+        del current_playing[guild_id]
+    
+    # Verificar si hay canciones en cola
+    if guild_id not in music_queues or not music_queues[guild_id]:
+        # Esperar el tiempo configurado antes de desconectar
+        channel = voice_client.channel
+        await channel.send(f"🛑 No hay más canciones en la cola. Me desconectaré en {DISCONNECT_AFTER} segundos...")
+        await asyncio.sleep(DISCONNECT_AFTER)
+        
+        if guild_id not in music_queues or not music_queues[guild_id]:
+            if voice_client.is_connected():
+                await channel.send("🔌 Desconectando por inactividad...")
+                await voice_client.disconnect()
+            return
+        # Verificar nuevamente si hay canciones en cola (pueden haber sido añadidas durante la espera)
+        if guild_id not in music_queues or not music_queues[guild_id]:
+            if voice_client.is_connected():
+                await voice_client.disconnect()
+            return
+        else:
+            # Si se añadieron canciones durante la espera, continuar reproduciendo
+            next_song = music_queues[guild_id].popleft()
+    else:
+        # Obtener la siguiente canción de la cola
+        next_song = music_queues[guild_id].popleft()
+    
+    # Registrar la canción actual
+    current_playing[guild_id] = next_song
+    
+    try:
+        # Configuración adaptativa basada en latencia
+        adaptive_options = FFMPEG_OPTIONS.copy()
+        if voice_client.latency > 0.3:  # Si hay mucho lag
+            adaptive_options['options'] = '-vn -b:a 96k'
+            
+        # Intentar con Opus primero (mejor calidad)
+        try:
+            source = await discord.FFmpegOpusAudio.from_probe(
+                next_song['url'],
+                **adaptive_options,
+                method='fallback'
+            )
+        except:
+            # Fallback a PCM si Opus falla
+            source = discord.FFmpegPCMAudio(
+                next_song['url'],
+                **adaptive_options
+            )
+        
+        # Ajustar buffer y volumen
+        if hasattr(source, '_player'):
+            source._player.opus_encoder.set_bitrate(128000)
+            source._player.buffer_size = 960 * 5  # 100ms buffer
+            
+        # Reproducir la canción
+        voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(guild_id, e), bot.loop))
+        
+        # Actualizar estado del bot
+        await bot.change_presence(activity=discord.Activity(
+            type=discord.ActivityType.listening,
+            name=next_song['title'][:50]
+        ))
+        
+    except Exception as e:
+        print(f"Error al reproducir: {traceback.format_exc()}")
+        await asyncio.sleep(2)
+        await play_next(guild_id)
+
+
+# ------------------------------------------
+# Comandos de Música
+# ------------------------------------------
+
+@bot.command(name="play", aliases=["p"])
+async def play(ctx, *, query: str):
+    """Reproduce música desde YouTube o la añade a la cola"""
+    if not ctx.author.voice:
+        return await ctx.send("🚨 Debes estar en un canal de voz para usar este comando!")
+
+    try:
+        # Obtener información del audio
+        data = await MusicPlayer.get_audio_source(query)
+        if not data:
+            return await ctx.send("❌ No se pudo encontrar el video o la canción")
+
+        # Conectar al canal de voz si no está conectado
+        voice_client = ctx.voice_client or await ctx.author.voice.channel.connect()
+        
+        # Inicializar cola si no existe
+        if ctx.guild.id not in music_queues:
+            music_queues[ctx.guild.id] = deque()
+
+        # Añadir a la cola
+        music_queues[ctx.guild.id].append(data)
+
+        # Reproducir si no hay nada sonando
+        if not voice_client.is_playing() and ctx.guild.id not in current_playing:
+            await play_next(ctx.guild.id)
+            await ctx.send(f"🎶 **Reproduciendo:** {data['title']}")
+        else:
+            await ctx.send(f"🎵 **Añadido a la cola:** {data['title']}")
+
+    except Exception as e:
+        await ctx.send(f"❌ Error al reproducir: {str(e)}")
+        print(f"Error en play: {traceback.format_exc()}")
+
+@bot.command(name="skip")
+async def skip(ctx):
+    """Salta la canción actual"""
+    voice_client = ctx.voice_client
+    if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
+        voice_client.stop()
+        await ctx.send("⏭️ Canción saltada")
+        await play_next(ctx.guild.id)
+    else:
+        await ctx.send("❌ No hay música reproduciéndose")
+
+@bot.command(name="stop")
+async def stop(ctx):
+    """Detiene la música y limpia la cola"""
+    voice_client = ctx.voice_client
+    if voice_client:
+        # Limpiar la cola y la canción actual
+        if ctx.guild.id in music_queues:
+            music_queues[ctx.guild.id].clear()
+        if ctx.guild.id in current_playing:
+            del current_playing[ctx.guild.id]
+        
+        # Detener la reproducción y desconectar
+        if voice_client.is_playing():
+            voice_client.stop()
+        
+        await voice_client.disconnect()
+        await ctx.send("⏹️ Música detenida y bot desconectado")
+    else:
+        await ctx.send("❌ No estoy conectado a un canal de voz")
+
+@bot.command(name="queue", aliases=["q"])
+async def queue(ctx):
+    """Muestra la cola de reproducción"""
+    queue_list = []
+    
+    # Canción actual
+    if ctx.guild.id in current_playing:
+        queue_list.append(f"**Reproduciendo ahora:**\n1. {current_playing[ctx.guild.id]['title']}")
+    
+    # Canciones en cola
+    if ctx.guild.id in music_queues and music_queues[ctx.guild.id]:
+        queue_list.append("\n**En cola:**")
+        for i, song in enumerate(list(music_queues[ctx.guild.id])[:10], start=2 if ctx.guild.id in current_playing else 1):
+            queue_list.append(f"{i}. {song['title']}")
+    
+    if not queue_list:
+        return await ctx.send("❌ No hay música en la cola")
+    
+    await ctx.send("\n".join(queue_list))
+
+@bot.command(name="quality")
+async def set_quality(ctx, quality: str = 'medium'):
+    """Ajusta la calidad de audio (low/medium/high)"""
+    if quality not in AUDIO_QUALITIES:
+        return await ctx.send("❌ Calidad no válida. Usa low/medium/high")
+    
+    FFMPEG_OPTIONS['options'] = AUDIO_QUALITIES[quality]['options']
+    await ctx.send(f"✅ Calidad establecida a **{quality}** (Bitrate: {AUDIO_QUALITIES[quality]['bitrate']})")
+
+@bot.command(name="pause")
+async def pause(ctx):
+    """Pausa la reproducción actual"""
+    voice = ctx.voice_client
+    if voice and voice.is_playing():
+        voice.pause()
+        await ctx.send("⏸️ Música pausada")
+    else:
+        await ctx.send("❌ No hay música reproduciéndose")
+
+@bot.command(name="resume")
+async def resume(ctx):
+    """Reanuda la reproducción pausada"""
+    voice = ctx.voice_client
+    if voice and voice.is_paused():
+        voice.resume()
+        await ctx.send("▶️ Música reanudada")
+    else:
+        await ctx.send("❌ No hay música pausada")
+
+@bot.command(name="nowplaying", aliases=["np"])
+async def nowplaying(ctx):
+    """Muestra la canción actual"""
+    if ctx.guild.id in current_playing:
+        await ctx.send(f"🎶 Reproduciendo ahora: {current_playing[ctx.guild.id]['title']}")
+    else:
+        await ctx.send("❌ No hay música reproduciéndose")
+
+@bot.command()
+async def latency(ctx):
+    """Mide la latencia del bot"""
+    before = time.monotonic()
+    message = await ctx.send("🏓 Probando latencia...")
+    ping = (time.monotonic() - before) * 1000
+    content = f"🏓 Latencia: {int(ping)}ms"
+    if ctx.voice_client:
+        content += f" | Voz: {int(ctx.voice_client.latency*1000)}ms"
+    await message.edit(content=content)
+    
+    
 # Constantes de configuración
 STAFF_ROLES = [1380930376343752704, 1380930523668549703, 1380930573899665538, 1380930606191607949]
 LOG_CHANNEL_ID = 1381026786368032819
@@ -390,9 +707,16 @@ async def limpiar(interaction: discord.Interaction, cantidad: int):
         return await interaction.response.send_message("❌ Solo el staff puede usar este comando.", ephemeral=True)
     
     cantidad = min(100, max(1, cantidad))
-    await interaction.channel.purge(limit=cantidad)
-    await interaction.response.send_message(
-        f"🧹 Se borraron {cantidad} mensajes.", 
+    
+    # Primero respondemos a la interacción
+    await interaction.response.defer(ephemeral=True)
+    
+    # Luego purgamos los mensajes
+    deleted = await interaction.channel.purge(limit=cantidad)
+    
+    # Finalmente enviamos la confirmación
+    await interaction.followup.send(
+        f"🧹 Se borraron {len(deleted)} mensajes.",
         ephemeral=True
     )
 
@@ -422,12 +746,53 @@ async def desmutear(interaction: discord.Interaction, usuario: discord.Member):
         await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
 
 # Eventos
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    # Reconectar automáticamente si el bot es desconectado
+    if member == bot.user and before.channel and not after.channel:
+        try:
+            await asyncio.sleep(2)
+            await before.channel.connect()
+            if before.channel.guild.id in music_queues and music_queues[before.channel.guild.id]:
+                voice = discord.utils.get(bot.voice_clients, guild=before.channel.guild)
+                if voice and not voice.is_playing():
+                    await play_next(before.channel.guild, voice)
+        except Exception as e:
+            print(f"Error al reconectar: {e}")
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    # Solo manejar cambios de estado del propio bot
+    if member != bot.user:
+        return
+    
+    # Si el bot fue desconectado forzosamente
+    if before.channel and not after.channel:
+        guild_id = before.channel.guild.id
+        if guild_id in music_queues:
+            music_queues[guild_id].clear()
+        if guild_id in current_playing:
+            del current_playing[guild_id]
+    
+    # Si el bot fue movido a otro canal
+    elif before.channel and after.channel and before.channel != after.channel:
+        # Notificar sobre el movimiento
+        channel = after.channel
+        await channel.send(f"🔊 Me han movido a este canal de voz")
+
 @bot.event
 async def on_ready():
     bot.add_view(TicketView())
-    bot.add_view(ModPanelView(author_id=0))  # Vista base para persistencia
+    bot.add_view(ModPanelView(author_id=0))
     await bot.tree.sync()
     print(f"✅ Bot listo como {bot.user}")
+    await bot.change_presence(activity=discord.Activity(
+        type=discord.ActivityType.listening,
+        name="!help"
+    ))
+
 
 # Ejecutar el bot
 bot.run(os.getenv("TOKEN"))
