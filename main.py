@@ -10,28 +10,12 @@ import yt_dlp
 from collections import deque
 import time
 import traceback
-import subprocess
-import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
-from spotipy.exceptions import SpotifyException
-import re
-
-import discord
-from discord import app_commands, ui
-from discord.ext import commands, tasks
-import os
-import asyncio
-from dotenv import load_dotenv
-from datetime import datetime
-import sqlite3
-import yt_dlp
-from collections import deque
-import time
-import traceback
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 from spotipy.exceptions import SpotifyException
 from typing import Dict, Deque, Optional, List
+import re
+
 
 # --------------------------
 # Configuración Inicial
@@ -47,6 +31,7 @@ intents.members = True
 intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+MUSIC_COMMANDS_CHANNEL_ID =958335891800207430
 
 # --------------------------
 # Constantes de Configuración
@@ -97,7 +82,7 @@ def setup_database():
     return conn, cursor
 
 db_conn, db_cursor = setup_database()
-
+song_history: Dict[int, List[Dict]] = {}
 
 # Sistema de colas por servidor
 music_queues = {}
@@ -115,7 +100,9 @@ class MusicQueue:
         self.current: Dict[int, Dict] = {}
         self.disconnect_timers: Dict[int, asyncio.Task] = {}
         self.locks: Dict[int, asyncio.Lock] = {}
-        self.is_playing: Dict[int, bool] = {}  # Nuevo: estado de reproducción por servidor
+        self.is_playing: Dict[int, bool] = {}
+        self.loop_modes: Dict[int, str] = {}  # 'none', 'song', 'queue'
+        self.playlists: Dict[int, Dict[str, List[Dict]]] = {}  # Guild ID -> {playlist_name: [songs]}
 
     def get_queue(self, guild_id: int) -> Deque:
         if guild_id not in self.queues:
@@ -157,9 +144,58 @@ class MusicQueue:
         """Obtiene el estado de reproducción"""
         return self.is_playing.get(guild_id, False)
 
-music_queue = MusicQueue()
+
+    def get_loop_mode(self, guild_id: int) -> str:
+        return self.loop_modes.get(guild_id, 'none')
+    
+    def set_loop_mode(self, guild_id: int, mode: str):
+        valid_modes = ['none', 'song', 'queue']
+        if mode not in valid_modes:
+            raise ValueError(f"Modo de loop inválido. Usa: {', '.join(valid_modes)}")
+        self.loop_modes[guild_id] = mode
+    
+    def toggle_loop_mode(self, guild_id: int) -> str:
+        modes = ['none', 'song', 'queue']
+        current = self.get_loop_mode(guild_id)
+        next_index = (modes.index(current) + 1) % len(modes)
+        self.set_loop_mode(guild_id, modes[next_index])
+        return modes[next_index]
+    
+    async def save_playlist(self, guild_id: int, name: str):
+        if guild_id not in self.playlists:
+            self.playlists[guild_id] = {}
+        
+        queue = await self.safe_get_queue(guild_id)
+        current = self.current.get(guild_id, None)
+        
+        songs = []
+        if current:
+            songs.append(current)
+        songs.extend(list(queue))
+        
+        if songs:
+            self.playlists[guild_id][name] = songs
+            return True
+        return False
+    
+    async def load_playlist(self, guild_id: int, name: str) -> Optional[List[Dict]]:
+        if guild_id not in self.playlists or name not in self.playlists[guild_id]:
+            return None
+        return self.playlists[guild_id][name]
+    
+    def get_playlist_names(self, guild_id: int) -> List[str]:
+        return list(self.playlists.get(guild_id, {}).keys())
+    
+    def delete_playlist(self, guild_id: int, name: str) -> bool:
+        if guild_id in self.playlists and name in self.playlists[guild_id]:
+            del self.playlists[guild_id][name]
+            return True
+        return False
 
 music_queue = MusicQueue()
+
+song_history: Dict[int, List[Dict]] = {} 
+
 
 class MusicPlayer:
     YDL_OPTIONS = {
@@ -218,55 +254,67 @@ async def play_next(guild_id: int, error=None):
         music_queue.set_playing(guild_id, False)
         return
 
-    # Cancelar cualquier temporizador existente primero
     await music_queue.cancel_disconnect_timer(guild_id)
-
-    # Doble verificación de la cola con delay
-    await asyncio.sleep(1.5)  # Pequeño delay para estabilidad
+    await asyncio.sleep(1.5)
+    
+    loop_mode = music_queue.get_loop_mode(guild_id)
+    current_song = music_queue.current.get(guild_id, None)
+    
+    # Manejo de loops
+    if loop_mode == 'song' and current_song:
+        queue = await music_queue.safe_get_queue(guild_id)
+        queue.appendleft(current_song)
+    
     queue = await music_queue.safe_get_queue(guild_id)
     
     if not queue:
-        music_queue.set_playing(guild_id, False)
-        
-        # Verificación final con otro pequeño delay
-        await asyncio.sleep(1)
-        queue = await music_queue.safe_get_queue(guild_id)
-        if not queue:
-            channel = voice_client.channel
-            await channel.send(f"🛑 No hay más canciones en la cola. Me desconectaré en {DISCONNECT_AFTER} segundos...")
-            
-            async def disconnect_task():
-                try:
-                    await asyncio.sleep(DISCONNECT_AFTER)
-                    
-                    # Última verificación antes de desconectar
-                    current_queue = await music_queue.safe_get_queue(guild_id)
-                    await music_queue.cancel_disconnect_timer(guild_id)
-                    if not current_queue and voice_client.is_connected():
-                        # Verificación final de reproducción
-                        if not voice_client.is_playing():
-                            await channel.send("🔌 Desconectando por inactividad...")
-                            await voice_client.disconnect()
-                except Exception as e:
-                    print(f"Error en desconexión automática: {e}")
-                finally:
-                    if guild_id in music_queue.disconnect_timers:
-                        del music_queue.disconnect_timers[guild_id]
-            
-            music_queue.disconnect_timers[guild_id] = asyncio.create_task(disconnect_task())
-            return
+        if loop_mode == 'queue' and current_song:
+            queue.append(current_song)
+        else:
+            music_queue.set_playing(guild_id, False)
+            await asyncio.sleep(1)
+            queue = await music_queue.safe_get_queue(guild_id)
+            if not queue:
+                channel = voice_client.channel
+                await channel.send(f"🛑 No hay más canciones en la cola. Me desconectaré en {DISCONNECT_AFTER} segundos...")
+                
+                async def disconnect_task():
+                    try:
+                        await asyncio.sleep(DISCONNECT_AFTER)
+                        current_queue = await music_queue.safe_get_queue(guild_id)
+                        await music_queue.cancel_disconnect_timer(guild_id)
+                        if not current_queue and voice_client.is_connected():
+                            if not voice_client.is_playing():
+                                await channel.send("🔌 Desconectando por inactividad...")
+                                await voice_client.disconnect()
+                    except Exception as e:
+                        print(f"Error en desconexión automática: {e}")
+                    finally:
+                        if guild_id in music_queue.disconnect_timers:
+                            del music_queue.disconnect_timers[guild_id]
+                
+                music_queue.disconnect_timers[guild_id] = asyncio.create_task(disconnect_task())
+                return
     
-    # Limpiar canción actual
-    if guild_id in music_queue.current:
-        del music_queue.current[guild_id]
-    
-    # Reproducir siguiente canción
     next_song = queue.popleft()
+    
     music_queue.current[guild_id] = next_song
+    
+    
+    # Registrar en historial
+    if guild_id not in song_history:
+        song_history[guild_id] = []
+
+    song_history[guild_id].append(next_song)
+
+    # Limitar historial a 10 canciones
+    if len(song_history[guild_id]) > 20:
+        song_history[guild_id].pop(0)
+
+    
     music_queue.set_playing(guild_id, True)
     
     try:
-        # Configuración adaptativa de calidad
         adaptive_options = FFMPEG_OPTIONS.copy()
         if voice_client.latency > 0.3:
             adaptive_options['options'] = '-vn -b:a 96k'
@@ -316,6 +364,7 @@ async def play(ctx, *, query: str):
         await music_queue.cancel_disconnect_timer(ctx.guild.id)
         
         data = await MusicPlayer.get_audio_source(query)
+        data["requested_by"] = ctx.author.display_name
         if not data:
             return await ctx.send("❌ No se pudo encontrar el video o la canción")
 
@@ -388,7 +437,14 @@ async def queue(ctx):
     queue_list = []
     
     if ctx.guild.id in music_queue.current:
-        queue_list.append(f"**Reproduciendo ahora:**\n1. {music_queue.current[ctx.guild.id]['title']}")
+        loop_status = ""
+        loop_mode = music_queue.get_loop_mode(ctx.guild.id)
+        if loop_mode == 'song':
+            loop_status = " (🔂 Repitiendo esta canción)"
+        elif loop_mode == 'queue':
+            loop_status = " (🔁 Repitiendo toda la cola)"
+            
+        queue_list.append(f"**Reproduciendo ahora:**\n1. {music_queue.current[ctx.guild.id]['title']}{loop_status}")
     
     queue = music_queue.get_queue(ctx.guild.id)
     if queue:
@@ -440,6 +496,140 @@ async def nowplaying(ctx):
             await ctx.send("⏸️ Hay música en cola pero no se está reproduciendo actualmente")
         else:
             await ctx.send("❌ No hay música reproduciéndose o en cola")
+
+@bot.command(name="loop", aliases=["repeat"])
+async def loop_command(ctx):
+    """Activa/desactiva el modo loop (canción/cola)"""
+    if not ctx.voice_client:
+        return await ctx.send("❌ No estoy conectado a un canal de voz")
+    
+    current_mode = music_queue.get_loop_mode(ctx.guild.id)
+    new_mode = music_queue.toggle_loop_mode(ctx.guild.id)
+    
+    modes = {
+        'none': '🔁 Loop desactivado',
+        'song': '🔂 Repitiendo canción actual',
+        'queue': '🔁 Repitiendo toda la cola'
+    }
+    
+    await ctx.send(f"{modes[new_mode]}")
+
+@bot.command(name="playlist", aliases=["pl"])
+async def playlist_command(ctx, action: str = None, *, name: str = None):
+    """Administra listas de reproducción. Subcomandos: save, load, list, delete"""
+    if not action:
+        return await ctx.send(
+            "📋 **Uso de listas de reproducción:**\n"
+            "`!playlist save <nombre>` - Guarda la cola actual como playlist\n"
+            "`!playlist load <nombre>` - Carga una playlist\n"
+            "`!playlist list` - Muestra tus playlists\n"
+            "`!playlist delete <nombre>` - Elimina una playlist"
+        )
+    
+    action = action.lower()
+    
+    if action == "save" and name:
+        if not ctx.voice_client or not music_queue.get_playing(ctx.guild.id):
+            return await ctx.send("❌ No hay música reproduciéndose para guardar")
+        
+        if len(name) > 30:
+            return await ctx.send("❌ El nombre de la playlist es demasiado largo (máx. 30 caracteres)")
+        
+        if await music_queue.save_playlist(ctx.guild.id, name):
+            await ctx.send(f"✅ Playlist guardada como **{name}**")
+        else:
+            await ctx.send("❌ No se pudo guardar la playlist (cola vacía)")
+    
+    elif action == "load" and name:
+        playlist = await music_queue.load_playlist(ctx.guild.id, name)
+        if not playlist:
+            return await ctx.send(f"❌ No se encontró la playlist **{name}**")
+        
+        if not ctx.author.voice:
+            return await ctx.send("🚨 Debes estar en un canal de voz para cargar una playlist!")
+        
+        voice_client = ctx.voice_client or await ctx.author.voice.channel.connect()
+        
+        # Añadir todas las canciones de la playlist
+        queue = await music_queue.safe_get_queue(ctx.guild.id)
+        for song in playlist:
+            queue.append(song)
+        
+        # Reproducir si no hay nada sonando
+        if not voice_client.is_playing() and not music_queue.get_playing(ctx.guild.id):
+            await play_next(ctx.guild.id)
+            await ctx.send(f"🎶 **Cargando playlist:** {name} ({len(playlist)} canciones)")
+        else:
+            await ctx.send(f"🎵 **Añadida playlist a la cola:** {name} ({len(playlist)} canciones)")
+    
+    elif action == "list":
+        playlists = music_queue.get_playlist_names(ctx.guild.id)
+        if not playlists:
+            return await ctx.send("❌ No hay playlists guardadas en este servidor")
+        
+        message = ["📋 **Playlists guardadas:**"]
+        for i, pl_name in enumerate(playlists, 1):
+            playlist = music_queue.playlists[ctx.guild.id][pl_name]
+            message.append(f"{i}. {pl_name} ({len(playlist)} canciones)")
+        
+        await ctx.send("\n".join(message))
+    
+    elif action == "delete" and name:
+        if music_queue.delete_playlist(ctx.guild.id, name):
+            await ctx.send(f"✅ Playlist **{name}** eliminada")
+        else:
+            await ctx.send(f"❌ No se encontró la playlist **{name}**")
+    
+    else:
+        await ctx.send("❌ Subcomando no válido. Usa `!playlist help` para ver opciones")
+
+@bot.command(name="history")
+async def history(ctx, cantidad: int = 5):
+    """Muestra las últimas canciones reproducidas (máx. 20)"""
+    if cantidad < 1 or cantidad > 20:
+        return await ctx.send("❌ Debes elegir un número entre 1 y 20.")
+
+    history_list = song_history.get(ctx.guild.id, [])
+    if not history_list:
+        return await ctx.send("📭 No hay historial disponible.")
+
+    history_slice = history_list[-cantidad:]
+    lines = [
+        f"{i+1}. {song['title']} — 🎧 solicitado por {song.get('requested_by', 'Desconocido')}"
+        for i, song in enumerate(reversed(history_slice))
+    ]
+    await ctx.send("📜 **Historial de canciones:**\n" + "\n".join(lines))
+
+
+@bot.command(name="replay")
+async def replay(ctx, indice: int):
+    """Vuelve a reproducir una canción del historial (!replay <número>)"""
+    history_list = song_history.get(ctx.guild.id, [])
+    if not history_list:
+        return await ctx.send("❌ No hay canciones en el historial.")
+
+    if indice < 1 or indice > min(10, len(history_list)):
+        return await ctx.send(f"❌ Índice inválido. Usa `!history` para ver el historial.")
+
+    # Obtener la canción desde el historial más reciente
+    song = list(reversed(history_list[-10:]))[indice - 1]
+
+    if not ctx.author.voice:
+        return await ctx.send("🚨 Debes estar en un canal de voz para usar este comando.")
+
+    voice_client = ctx.voice_client or await ctx.author.voice.channel.connect()
+    queue = await music_queue.safe_get_queue(ctx.guild.id)
+    queue.append(song)
+
+    if not voice_client.is_playing() and not music_queue.get_playing(ctx.guild.id):
+        await play_next(ctx.guild.id)
+        await ctx.send(f"▶️ Reproduciendo nuevamente: **{song['title']}** (solicitado por {song.get('requested_by', 'Desconocido')})")
+    else:
+        await ctx.send(f"🎵 Añadida a la cola: **{song['title']}** (solicitado por {song.get('requested_by', 'Desconocido')})")
+
+
+
+
 
 @bot.command()
 async def latency(ctx):
@@ -879,6 +1069,96 @@ async def limpiar(interaction: discord.Interaction, cantidad: int):
 
 
 
+async def post_music_commands():
+    channel = bot.get_channel(MUSIC_COMMANDS_CHANNEL_ID)
+    if not channel:
+        print("❌ Canal de comandos musicales no encontrado.")
+        return
+
+    # Verifica si ya existe el mensaje fijado
+    pinned = await channel.pins()
+    for msg in pinned:
+        if msg.author == bot.user and "¡Comandos de Música" in (msg.embeds[0].title if msg.embeds else msg.content):
+            return  # Ya está fijado
+
+    embed = discord.Embed(
+        title="🎧 ¡Comandos de Música Disponibles!",
+        description="Aquí tienes todo lo que puedes hacer con el bot musical:",
+        color=discord.Color.purple()
+    )
+
+    embed.add_field(
+        name="🎵 Reproducción Básica",
+        value=(
+            "`!play <nombre o link>` — Reproduce o agrega una canción\n"
+            "`!skip` — Salta la canción actual\n"
+            "`!stop` — Detiene la música y desconecta\n"
+            "`!pause` — Pausa la canción\n"
+            "`!resume` — Reanuda la reproducción"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📃 Información",
+        value=(
+            "`!queue` — Muestra la cola de reproducción\n"
+            "`!nowplaying` / `!np` — Muestra la canción actual"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🔁 Repetición",
+        value=(
+            "`!loop` / `!repeat` — Alterna entre repetir canción, cola o desactivar"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📂 Playlists",
+        value=(
+            "`!playlist save <nombre>` — Guarda la cola actual\n"
+            "`!playlist load <nombre>` — Carga una playlist\n"
+            "`!playlist list` — Muestra tus playlists\n"
+            "`!playlist delete <nombre>` — Elimina una playlist"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🔊 Audio",
+        value="`!quality <low|medium|high>` — Cambia la calidad del sonido",
+        inline=False
+    )
+
+    embed.add_field(
+        name="🕘 Historial",
+        value=(
+            "`!history [número]` — Muestra las últimas canciones (máx. 10)\n"
+            "`!replay <número>` — Vuelve a reproducir una canción del historial"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📡 Diagnóstico",
+        value="`!latency` — Mide la latencia del bot y la voz",
+        inline=False
+    )
+
+    embed.set_footer(text="💡 Usa !p como atajo para !play | El bot se desconecta tras 60s de inactividad.")
+    embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/727/727240.png")  # Ícono opcional
+
+    try:
+        msg = await channel.send(embed=embed)
+        await msg.pin()
+    except Exception as e:
+        print(f"❌ Error al enviar o fijar el embed: {e}")
+
+
+
 # --------------------------
 # Eventos
 # --------------------------
@@ -903,6 +1183,7 @@ async def on_ready():
         type=discord.ActivityType.listening,
         name="!help"
     ))
+    await post_music_commands()
 
 # --------------------------
 # Ejecución del Bot
