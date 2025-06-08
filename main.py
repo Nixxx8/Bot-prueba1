@@ -16,7 +16,6 @@ from spotipy.exceptions import SpotifyException
 from typing import Dict, Deque, Optional, List
 import re
 
-
 # --------------------------
 # Configuración Inicial
 # --------------------------
@@ -32,6 +31,7 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 MUSIC_COMMANDS_CHANNEL_ID =958335891800207430
+OWNER_IDS = [617137933022920707]  
 
 # --------------------------
 # Constantes de Configuración
@@ -103,6 +103,7 @@ class MusicQueue:
         self.is_playing: Dict[int, bool] = {}
         self.loop_modes: Dict[int, str] = {}  # 'none', 'song', 'queue'
         self.playlists: Dict[int, Dict[str, List[Dict]]] = {}  # Guild ID -> {playlist_name: [songs]}
+        self.autoplay_enabled = {}
 
     def get_queue(self, guild_id: int) -> Deque:
         if guild_id not in self.queues:
@@ -191,6 +192,15 @@ class MusicQueue:
             del self.playlists[guild_id][name]
             return True
         return False
+    
+    def is_autoplay(self, guild_id: int) -> bool:
+        return self.autoplay_enabled.get(guild_id, False)
+
+    def set_autoplay(self, guild_id: int, enabled: bool):
+        self.autoplay_enabled[guild_id] = enabled
+
+
+
 
 music_queue = MusicQueue()
 
@@ -271,6 +281,13 @@ async def play_next(guild_id: int, error=None):
         if loop_mode == 'queue' and current_song:
             queue.append(current_song)
         else:
+    # Autoplay activado
+            if music_queue.is_autoplay(guild_id) and current_song:
+                related = await get_related_song(current_song['title'])
+                if related:
+                    queue.append(related)
+                    return await play_next(guild_id)
+
             music_queue.set_playing(guild_id, False)
             await asyncio.sleep(1)
             queue = await music_queue.safe_get_queue(guild_id)
@@ -297,9 +314,13 @@ async def play_next(guild_id: int, error=None):
                 return
     
     next_song = queue.popleft()
-    
     music_queue.current[guild_id] = next_song
     
+    # Anunciar canción si fue por autoplay
+    if next_song.get("requested_by") == "Autoplay":
+        channel = voice_client.channel
+        await channel.send(f"🎶 Reproduciendo sugerencia por autoplay: **{next_song['title']}**")
+
     
     # Registrar en historial
     if guild_id not in song_history:
@@ -628,6 +649,33 @@ async def replay(ctx, indice: int):
         await ctx.send(f"🎵 Añadida a la cola: **{song['title']}** (solicitado por {song.get('requested_by', 'Desconocido')})")
 
 
+@bot.command(name="autoplay")
+async def autoplay(ctx, modo: str = None):
+    """Activa o desactiva el modo autoplay"""
+    if modo not in ["on", "off"]:
+        estado = "activado" if music_queue.is_autoplay(ctx.guild.id) else "desactivado"
+        return await ctx.send(f"🔁 Autoplay actualmente **{estado}**. Usa `!autoplay on` o `!autoplay off`.")
+
+    activar = modo == "on"
+    music_queue.set_autoplay(ctx.guild.id, activar)
+    await ctx.send(f"✅ Autoplay {'activado' if activar else 'desactivado'}")
+
+async def get_related_song(title: str) -> Optional[Dict]:
+    try:
+        with yt_dlp.YoutubeDL(MusicPlayer.YDL_OPTIONS) as ydl:
+            query = f"ytsearch:{title} audio"
+            info = await bot.loop.run_in_executor(None, lambda: ydl.extract_info(query, download=False))
+            if 'entries' in info and info['entries']:
+                video = info['entries'][0]
+                return {
+                    'url': video['url'],
+                    'title': video.get('title', 'Sugerido'),
+                    'duration': video.get('duration', 0),
+                    'requested_by': "Autoplay"
+                }
+    except Exception as e:
+        print(f"[Autoplay] Error buscando canción relacionada: {e}")
+    return None
 
 
 
@@ -1078,78 +1126,86 @@ async def post_music_commands():
     # Verifica si ya existe el mensaje fijado
     pinned = await channel.pins()
     for msg in pinned:
-        if msg.author == bot.user and "¡Comandos de Música" in (msg.embeds[0].title if msg.embeds else msg.content):
-            return  # Ya está fijado
+        if msg.author == bot.user and ("¡Comandos de Música" in (msg.embeds[0].title if msg.embeds else msg.content)):
+            return
 
     embed = discord.Embed(
-        title="🎧 ¡Comandos de Música Disponibles!",
-        description="Aquí tienes todo lo que puedes hacer con el bot musical:",
+        title="🎶 ¡Comandos del Bot Musical y Moderador!",
+        description="Explorá todo lo que podés hacer con este bot:",
         color=discord.Color.purple()
     )
 
     embed.add_field(
-        name="🎵 Reproducción Básica",
+        name="🎵 Reproducción de Música",
         value=(
             "`!play <nombre o link>` — Reproduce o agrega una canción\n"
             "`!skip` — Salta la canción actual\n"
-            "`!stop` — Detiene la música y desconecta\n"
-            "`!pause` — Pausa la canción\n"
-            "`!resume` — Reanuda la reproducción"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="📃 Información",
-        value=(
-            "`!queue` — Muestra la cola de reproducción\n"
+            "`!stop` — Detiene todo y desconecta\n"
+            "`!pause` / `!resume` — Pausa o reanuda\n"
             "`!nowplaying` / `!np` — Muestra la canción actual"
         ),
         inline=False
     )
 
     embed.add_field(
-        name="🔁 Repetición",
+        name="🧾 Cola y Historial",
         value=(
-            "`!loop` / `!repeat` — Alterna entre repetir canción, cola o desactivar"
+            "`!queue` / `!q` — Muestra la cola\n"
+            "`!history [número]` — Ver historial (máx. 20)\n"
+            "`!replay <número>` — Reproduce una canción del historial"
         ),
         inline=False
     )
 
     embed.add_field(
-        name="📂 Playlists",
+        name="🔁 Repetición y Autoplay",
         value=(
-            "`!playlist save <nombre>` — Guarda la cola actual\n"
+            "`!loop` — Alterna entre repetir canción, cola o desactivar\n"
+            "`!autoplay on/off` — Reproduce sugerencias automáticas si la cola se vacía"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📂 Playlists personalizadas",
+        value=(
+            "`!playlist save <nombre>` — Guarda la cola\n"
             "`!playlist load <nombre>` — Carga una playlist\n"
-            "`!playlist list` — Muestra tus playlists\n"
+            "`!playlist list` — Ver playlists guardadas\n"
             "`!playlist delete <nombre>` — Elimina una playlist"
         ),
         inline=False
     )
 
     embed.add_field(
-        name="🔊 Audio",
-        value="`!quality <low|medium|high>` — Cambia la calidad del sonido",
+        name="🎚️ Calidad de Audio",
+        value="`!quality <low | medium | high>` — Ajusta la calidad del sonido",
         inline=False
     )
 
     embed.add_field(
-        name="🕘 Historial",
-        value=(
-            "`!history [número]` — Muestra las últimas canciones (máx. 10)\n"
-            "`!replay <número>` — Vuelve a reproducir una canción del historial"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="📡 Diagnóstico",
+        name="⚡ Utilidades",
         value="`!latency` — Mide la latencia del bot y la voz",
         inline=False
     )
 
-    embed.set_footer(text="💡 Usa !p como atajo para !play | El bot se desconecta tras 60s de inactividad.")
-    embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/727/727240.png")  # Ícono opcional
+    embed.add_field(
+        name="🛡️ Moderación y Soporte (Staff)",
+        value=(
+            "`/ticket` — Crear ticket de soporte\n"
+            "`/advertir` — Enviar advertencia\n"
+            "`/mutear` / `/desmutear` — Silenciar o restaurar voz\n"
+            "`/banear` — Expulsar usuarios\n"
+            "`/infracciones` — Ver historial disciplinario\n"
+            "`/limpiar` — Borrar mensajes\n"
+            "`/modpanel` — Panel de herramientas\n"
+            "`/limpiar_infracciones` — Eliminar historial disciplinario"
+        ),
+        inline=False
+    )
+
+    embed.set_footer(text="💡 Usa !p como atajo de !play | El bot se desconecta tras 60s sin música.")
+    embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/727/727240.png")
 
     try:
         msg = await channel.send(embed=embed)
@@ -1157,6 +1213,14 @@ async def post_music_commands():
     except Exception as e:
         print(f"❌ Error al enviar o fijar el embed: {e}")
 
+@bot.command(name="shutdown")
+async def shutdown(ctx):
+    """Apaga el bot (solo staff autorizado)"""
+    if ctx.author.id not in OWNER_IDS and not await is_staff(ctx.author):
+        return await ctx.send("❌ No tenés permisos para apagar el bot.")
+
+    await ctx.send("🛑 Apagando bot... ¡Hasta luego!")
+    await bot.close()
 
 
 # --------------------------
