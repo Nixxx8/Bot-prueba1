@@ -11,8 +11,13 @@ from collections import deque
 import time
 import traceback
 import subprocess
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
+from spotipy.exceptions import SpotifyException
+import re
 
 # Configuración inicial
+disconnect_timers = {}
 load_dotenv()
 intents = discord.Intents.default()
 intents.message_content = True
@@ -20,6 +25,9 @@ intents.members = True
 intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+
 
 # ------------------------------------------
 # Configuración del Sistema de Música
@@ -117,52 +125,51 @@ class MusicPlayer:
 async def play_next(guild_id: int, error=None):
     voice_client = discord.utils.get(bot.voice_clients, guild=bot.get_guild(guild_id))
     
-    # Verificar si hay un error previo
     if error:
         print(f"Error en reproducción: {error}")
     
-    # Si no hay cliente de voz o no está conectado, salir
     if not voice_client or not voice_client.is_connected():
         return
 
-    # Limpiar canción actual si existe
     if guild_id in current_playing:
         del current_playing[guild_id]
     
-    # Verificar si hay canciones en cola
+    # Cancelar temporizador de desconexión si existe
+    if guild_id in disconnect_timers:
+        disconnect_timers[guild_id].cancel()
+        del disconnect_timers[guild_id]
+    
     if guild_id not in music_queues or not music_queues[guild_id]:
-        # Esperar el tiempo configurado antes de desconectar
         channel = voice_client.channel
         await channel.send(f"🛑 No hay más canciones en la cola. Me desconectaré en {DISCONNECT_AFTER} segundos...")
-        await asyncio.sleep(DISCONNECT_AFTER)
         
-        if guild_id not in music_queues or not music_queues[guild_id]:
-            if voice_client.is_connected():
-                await channel.send("🔌 Desconectando por inactividad...")
-                await voice_client.disconnect()
-            return
-        # Verificar nuevamente si hay canciones en cola (pueden haber sido añadidas durante la espera)
-        if guild_id not in music_queues or not music_queues[guild_id]:
-            if voice_client.is_connected():
-                await voice_client.disconnect()
-            return
-        else:
-            # Si se añadieron canciones durante la espera, continuar reproduciendo
-            next_song = music_queues[guild_id].popleft()
-    else:
-        # Obtener la siguiente canción de la cola
-        next_song = music_queues[guild_id].popleft()
+        # Crear una tarea de desconexión que pueda ser cancelada
+        async def disconnect_task():
+            try:
+                await asyncio.sleep(DISCONNECT_AFTER)
+                
+                # Verificar nuevamente antes de desconectar
+                if guild_id not in music_queues or not music_queues[guild_id]:
+                    if voice_client.is_connected():
+                        await channel.send("🔌 Desconectando por inactividad...")
+                        await voice_client.disconnect()
+            except Exception as e:
+                print(f"Error en desconexión automática: {e}")
+            finally:
+                if guild_id in disconnect_timers:
+                    del disconnect_timers[guild_id]
+        
+        disconnect_timers[guild_id] = asyncio.create_task(disconnect_task())
+        return
     
-    # Registrar la canción actual
+    next_song = music_queues[guild_id].popleft()
     current_playing[guild_id] = next_song
     
     try:
-        # Configuración adaptativa basada en latencia
         adaptive_options = FFMPEG_OPTIONS.copy()
-        if voice_client.latency > 0.3:  # Si hay mucho lag
+        if voice_client.latency > 0.3:
             adaptive_options['options'] = '-vn -b:a 96k'
             
-        # Intentar con Opus primero (mejor calidad)
         try:
             source = await discord.FFmpegOpusAudio.from_probe(
                 next_song['url'],
@@ -170,21 +177,17 @@ async def play_next(guild_id: int, error=None):
                 method='fallback'
             )
         except:
-            # Fallback a PCM si Opus falla
             source = discord.FFmpegPCMAudio(
                 next_song['url'],
                 **adaptive_options
             )
         
-        # Ajustar buffer y volumen
         if hasattr(source, '_player'):
             source._player.opus_encoder.set_bitrate(128000)
-            source._player.buffer_size = 960 * 5  # 100ms buffer
+            source._player.buffer_size = 960 * 5
             
-        # Reproducir la canción
         voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(guild_id, e), bot.loop))
         
-        # Actualizar estado del bot
         await bot.change_presence(activity=discord.Activity(
             type=discord.ActivityType.listening,
             name=next_song['title'][:50]
@@ -207,22 +210,23 @@ async def play(ctx, *, query: str):
         return await ctx.send("🚨 Debes estar en un canal de voz para usar este comando!")
 
     try:
-        # Obtener información del audio
+        # Cancelar desconexión pendiente si existe
+        if ctx.guild.id in disconnect_timers:
+            disconnect_timers[ctx.guild.id].cancel()
+            del disconnect_timers[ctx.guild.id]
+        
+        # Resto de la lógica del comando play...
         data = await MusicPlayer.get_audio_source(query)
         if not data:
             return await ctx.send("❌ No se pudo encontrar el video o la canción")
 
-        # Conectar al canal de voz si no está conectado
         voice_client = ctx.voice_client or await ctx.author.voice.channel.connect()
         
-        # Inicializar cola si no existe
         if ctx.guild.id not in music_queues:
             music_queues[ctx.guild.id] = deque()
 
-        # Añadir a la cola
         music_queues[ctx.guild.id].append(data)
 
-        # Reproducir si no hay nada sonando
         if not voice_client.is_playing() and ctx.guild.id not in current_playing:
             await play_next(ctx.guild.id)
             await ctx.send(f"🎶 **Reproduciendo:** {data['title']}")
@@ -744,6 +748,7 @@ async def desmutear(interaction: discord.Interaction, usuario: discord.Member):
         await interaction.response.send_message(embed=embed)
     except Exception as e:
         await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
+
 
 # Eventos
 
