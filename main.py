@@ -10,101 +10,222 @@ import yt_dlp
 from collections import deque
 import time
 import traceback
-import subprocess
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 from spotipy.exceptions import SpotifyException
+from typing import Dict, Deque, Optional, List
 import re
 
-# Configuración inicial
-disconnect_timers = {}
+
+# --------------------------
+# Configuración Inicial
+# --------------------------
+
+# Carga de variables de entorno
 load_dotenv()
+
+# Configuración de intents
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+MUSIC_COMMANDS_CHANNEL_ID =958335891800207430
 
+# --------------------------
+# Constantes de Configuración
+# --------------------------
 
-
-
-# ------------------------------------------
-# Configuración del Sistema de Música
-# ------------------------------------------
-
-# Configuración optimizada de FFmpeg
+# Configuración general
 DISCONNECT_AFTER = 60
+MUTE_ROLE_NAME = "Muted"
+MAX_ADVERTENCIAS = 7
+ALERTA_ADVERTENCIAS = 5
 
+# IDs de roles y canales
+STAFF_ROLES = [1380930376343752704, 1380930523668549703, 1380930573899665538, 1380930606191607949]
+LOG_CHANNEL_ID = 1381026786368032819
+TICKET_CATEGORY_ID = 1380982177344520287
+
+# Configuración de audio
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -probesize 32M -analyzeduration 32M',
     'options': '-vn -c:a libopus -b:a 128k -ar 48000 -ac 2 -filter:a "volume=0.8"',
-    'executable': 'ffmpeg',  # Asegúrate de que FFmpeg esté en tu PATH
+    'executable': 'ffmpeg',
 }
 
-# Calidades de audio disponibles
 AUDIO_QUALITIES = {
     'low': {'bitrate': '64k', 'options': '-vn -af "volume=0.9"'},
     'medium': {'bitrate': '128k', 'options': '-vn -af "dynaudnorm=f=150:g=15"'},
     'high': {'bitrate': '192k', 'options': '-vn -ar 48000 -ac 2 -af "dynaudnorm=f=150:g=15"'}
 }
 
-ydl_opts = {
-    'format': 'bestaudio/best',
-    'quiet': True,
-    'no_warnings': True,
-    'noplaylist': True,
-    'socket_timeout': 5,
-    'source_address': '0.0.0.0',
-    'force-ipv4': True,
-    'extractor_args': {
-        'youtube': {
-            'player_skip': ['js'],
-            'skip': ['hls', 'dash', 'translated_subs']
-        }
-    },
-    'postprocessor_args': {
-        'key': 'FFmpegExtractAudio',
-        'preferredcodec': 'opus',
-        'preferredquality': '192',
-    }
-}
+# --------------------------
+# Base de Datos
+# --------------------------
+
+def setup_database():
+    conn = sqlite3.connect('moderacion.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS infracciones (
+        user_id INTEGER,
+        guild_id INTEGER,
+        motivo TEXT,
+        fecha TEXT,
+        PRIMARY KEY (user_id, guild_id, fecha)
+    )
+    ''')
+    conn.commit()
+    return conn, cursor
+
+db_conn, db_cursor = setup_database()
+song_history: Dict[int, List[Dict]] = {}
 
 # Sistema de colas por servidor
 music_queues = {}
 current_playing = {}  # Trackea la canción actual por servidor
 
-class MusicPlayer:
-    @staticmethod
-    async def get_audio_source(query: str):
-        """Obtiene información del audio desde YouTube"""
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'quiet': True,
-            'no_warnings': True,
-            'extractaudio': True,
-            'audioformat': 'mp3',
-            'noplaylist': True,
-            'socket_timeout': 5,
-            'source_address': '0.0.0.0',
-            'force-ipv4': True,
-            'cachedir': False,
-            'extractor_args': {
-                'youtube': {
-                    'player_skip': ['configs', 'webpage'],
-                    'skip': ['hls', 'dash', 'translated_subs']
-                }
-            },
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }]
-        }
+
+
+# --------------------------
+# Clases Principales
+# --------------------------
+
+class MusicQueue:
+    def __init__(self):
+        self.queues: Dict[int, Deque] = {}
+        self.current: Dict[int, Dict] = {}
+        self.disconnect_timers: Dict[int, asyncio.Task] = {}
+        self.locks: Dict[int, asyncio.Lock] = {}
+        self.is_playing: Dict[int, bool] = {}
+        self.loop_modes: Dict[int, str] = {}  # 'none', 'song', 'queue'
+        self.playlists: Dict[int, Dict[str, List[Dict]]] = {}  # Guild ID -> {playlist_name: [songs]}
+
+    def get_queue(self, guild_id: int) -> Deque:
+        if guild_id not in self.queues:
+            self.queues[guild_id] = deque()
+            self.locks[guild_id] = asyncio.Lock()
+            self.is_playing[guild_id] = False  # Inicializar estado
+        return self.queues[guild_id]
+
+    def clear(self, guild_id: int):
+        if guild_id in self.queues:
+            self.queues[guild_id].clear()
+        if guild_id in self.current:
+            del self.current[guild_id]
+        if guild_id in self.is_playing:
+            self.is_playing[guild_id] = False
+
+    async def cancel_disconnect_timer(self, guild_id: int):
+        if guild_id in self.disconnect_timers:
+            try:
+                self.disconnect_timers[guild_id].cancel()
+            except:
+                pass
+            del self.disconnect_timers[guild_id]
+
+    async def safe_get_queue(self, guild_id: int) -> Deque:
+        """Obtiene la cola de manera segura usando un lock"""
+        if guild_id not in self.locks:
+            self.locks[guild_id] = asyncio.Lock()
+        async with self.locks[guild_id]:
+            return self.get_queue(guild_id)
+
+    def set_playing(self, guild_id: int, status: bool):
+        """Actualiza el estado de reproducción"""
+        if guild_id not in self.is_playing:
+            self.is_playing[guild_id] = False
+        self.is_playing[guild_id] = status
+
+    def get_playing(self, guild_id: int) -> bool:
+        """Obtiene el estado de reproducción"""
+        return self.is_playing.get(guild_id, False)
+
+
+    def get_loop_mode(self, guild_id: int) -> str:
+        return self.loop_modes.get(guild_id, 'none')
+    
+    def set_loop_mode(self, guild_id: int, mode: str):
+        valid_modes = ['none', 'song', 'queue']
+        if mode not in valid_modes:
+            raise ValueError(f"Modo de loop inválido. Usa: {', '.join(valid_modes)}")
+        self.loop_modes[guild_id] = mode
+    
+    def toggle_loop_mode(self, guild_id: int) -> str:
+        modes = ['none', 'song', 'queue']
+        current = self.get_loop_mode(guild_id)
+        next_index = (modes.index(current) + 1) % len(modes)
+        self.set_loop_mode(guild_id, modes[next_index])
+        return modes[next_index]
+    
+    async def save_playlist(self, guild_id: int, name: str):
+        if guild_id not in self.playlists:
+            self.playlists[guild_id] = {}
         
+        queue = await self.safe_get_queue(guild_id)
+        current = self.current.get(guild_id, None)
+        
+        songs = []
+        if current:
+            songs.append(current)
+        songs.extend(list(queue))
+        
+        if songs:
+            self.playlists[guild_id][name] = songs
+            return True
+        return False
+    
+    async def load_playlist(self, guild_id: int, name: str) -> Optional[List[Dict]]:
+        if guild_id not in self.playlists or name not in self.playlists[guild_id]:
+            return None
+        return self.playlists[guild_id][name]
+    
+    def get_playlist_names(self, guild_id: int) -> List[str]:
+        return list(self.playlists.get(guild_id, {}).keys())
+    
+    def delete_playlist(self, guild_id: int, name: str) -> bool:
+        if guild_id in self.playlists and name in self.playlists[guild_id]:
+            del self.playlists[guild_id][name]
+            return True
+        return False
+
+music_queue = MusicQueue()
+
+song_history: Dict[int, List[Dict]] = {} 
+
+
+class MusicPlayer:
+    YDL_OPTIONS = {
+        'format': 'bestaudio/best',
+        'quiet': True,
+        'no_warnings': True,
+        'extractaudio': True,
+        'audioformat': 'mp3',
+        'noplaylist': True,
+        'socket_timeout': 5,
+        'source_address': '0.0.0.0',
+        'force-ipv4': True,
+        'cachedir': False,
+        'extractor_args': {
+            'youtube': {
+                'player_skip': ['configs', 'webpage'],
+                'skip': ['hls', 'dash', 'translated_subs']
+            }
+        },
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }]
+    }
+
+    @classmethod
+    async def get_audio_source(cls, query: str) -> Optional[Dict]:
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # Si no es una URL, buscar como consulta
+            with yt_dlp.YoutubeDL(cls.YDL_OPTIONS) as ydl:
                 if not query.startswith(('http://', 'https://')):
                     query = f"ytsearch:{query}"
                 
@@ -118,7 +239,7 @@ class MusicPlayer:
                     'title': info.get('title', 'Audio desconocido'),
                     'duration': info.get('duration', 0)
                 }
-        except Exception as e:
+        except Exception:
             print(f"Error al obtener audio: {traceback.format_exc()}")
             return None
 
@@ -127,43 +248,71 @@ async def play_next(guild_id: int, error=None):
     
     if error:
         print(f"Error en reproducción: {error}")
+        music_queue.set_playing(guild_id, False)
     
     if not voice_client or not voice_client.is_connected():
+        music_queue.set_playing(guild_id, False)
         return
 
-    if guild_id in current_playing:
-        del current_playing[guild_id]
+    await music_queue.cancel_disconnect_timer(guild_id)
+    await asyncio.sleep(1.5)
     
-    # Cancelar temporizador de desconexión si existe
-    if guild_id in disconnect_timers:
-        disconnect_timers[guild_id].cancel()
-        del disconnect_timers[guild_id]
+    loop_mode = music_queue.get_loop_mode(guild_id)
+    current_song = music_queue.current.get(guild_id, None)
     
-    if guild_id not in music_queues or not music_queues[guild_id]:
-        channel = voice_client.channel
-        await channel.send(f"🛑 No hay más canciones en la cola. Me desconectaré en {DISCONNECT_AFTER} segundos...")
-        
-        # Crear una tarea de desconexión que pueda ser cancelada
-        async def disconnect_task():
-            try:
-                await asyncio.sleep(DISCONNECT_AFTER)
+    # Manejo de loops
+    if loop_mode == 'song' and current_song:
+        queue = await music_queue.safe_get_queue(guild_id)
+        queue.appendleft(current_song)
+    
+    queue = await music_queue.safe_get_queue(guild_id)
+    
+    if not queue:
+        if loop_mode == 'queue' and current_song:
+            queue.append(current_song)
+        else:
+            music_queue.set_playing(guild_id, False)
+            await asyncio.sleep(1)
+            queue = await music_queue.safe_get_queue(guild_id)
+            if not queue:
+                channel = voice_client.channel
+                await channel.send(f"🛑 No hay más canciones en la cola. Me desconectaré en {DISCONNECT_AFTER} segundos...")
                 
-                # Verificar nuevamente antes de desconectar
-                if guild_id not in music_queues or not music_queues[guild_id]:
-                    if voice_client.is_connected():
-                        await channel.send("🔌 Desconectando por inactividad...")
-                        await voice_client.disconnect()
-            except Exception as e:
-                print(f"Error en desconexión automática: {e}")
-            finally:
-                if guild_id in disconnect_timers:
-                    del disconnect_timers[guild_id]
-        
-        disconnect_timers[guild_id] = asyncio.create_task(disconnect_task())
-        return
+                async def disconnect_task():
+                    try:
+                        await asyncio.sleep(DISCONNECT_AFTER)
+                        current_queue = await music_queue.safe_get_queue(guild_id)
+                        await music_queue.cancel_disconnect_timer(guild_id)
+                        if not current_queue and voice_client.is_connected():
+                            if not voice_client.is_playing():
+                                await channel.send("🔌 Desconectando por inactividad...")
+                                await voice_client.disconnect()
+                    except Exception as e:
+                        print(f"Error en desconexión automática: {e}")
+                    finally:
+                        if guild_id in music_queue.disconnect_timers:
+                            del music_queue.disconnect_timers[guild_id]
+                
+                music_queue.disconnect_timers[guild_id] = asyncio.create_task(disconnect_task())
+                return
     
-    next_song = music_queues[guild_id].popleft()
-    current_playing[guild_id] = next_song
+    next_song = queue.popleft()
+    
+    music_queue.current[guild_id] = next_song
+    
+    
+    # Registrar en historial
+    if guild_id not in song_history:
+        song_history[guild_id] = []
+
+    song_history[guild_id].append(next_song)
+
+    # Limitar historial a 10 canciones
+    if len(song_history[guild_id]) > 20:
+        song_history[guild_id].pop(0)
+
+    
+    music_queue.set_playing(guild_id, True)
     
     try:
         adaptive_options = FFMPEG_OPTIONS.copy()
@@ -195,6 +344,7 @@ async def play_next(guild_id: int, error=None):
         
     except Exception as e:
         print(f"Error al reproducir: {traceback.format_exc()}")
+        music_queue.set_playing(guild_id, False)
         await asyncio.sleep(2)
         await play_next(guild_id)
 
@@ -210,83 +360,101 @@ async def play(ctx, *, query: str):
         return await ctx.send("🚨 Debes estar en un canal de voz para usar este comando!")
 
     try:
-        # Cancelar desconexión pendiente si existe
-        if ctx.guild.id in disconnect_timers:
-            disconnect_timers[ctx.guild.id].cancel()
-            del disconnect_timers[ctx.guild.id]
+        # Cancelar cualquier temporizador de desconexión primero
+        await music_queue.cancel_disconnect_timer(ctx.guild.id)
         
-        # Resto de la lógica del comando play...
         data = await MusicPlayer.get_audio_source(query)
+        data["requested_by"] = ctx.author.display_name
         if not data:
             return await ctx.send("❌ No se pudo encontrar el video o la canción")
 
         voice_client = ctx.voice_client or await ctx.author.voice.channel.connect()
         
-        if ctx.guild.id not in music_queues:
-            music_queues[ctx.guild.id] = deque()
+        # Añadir a la cola de manera segura
+        queue = await music_queue.safe_get_queue(ctx.guild.id)
+        queue.append(data)
 
-        music_queues[ctx.guild.id].append(data)
-
-        if not voice_client.is_playing() and ctx.guild.id not in current_playing:
+        # Verificar si debemos empezar a reproducir
+        if not voice_client.is_playing() and not music_queue.get_playing(ctx.guild.id):
             await play_next(ctx.guild.id)
             await ctx.send(f"🎶 **Reproduciendo:** {data['title']}")
         else:
             await ctx.send(f"🎵 **Añadido a la cola:** {data['title']}")
 
     except Exception as e:
-        await ctx.send(f"❌ Error al reproducir: {str(e)}")
+        await ctx.send("❌ Error al reproducir")
         print(f"Error en play: {traceback.format_exc()}")
 
 @bot.command(name="skip")
 async def skip(ctx):
     """Salta la canción actual"""
     voice_client = ctx.voice_client
-    if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
+    if not voice_client:
+        return await ctx.send("❌ No estoy conectado a un canal de voz")
+    
+    queue = await music_queue.safe_get_queue(ctx.guild.id)
+    if not queue and not music_queue.get_playing(ctx.guild.id):
+        return await ctx.send("❌ No hay música en la cola")
+    
+    if voice_client.is_playing() or voice_client.is_paused():
+        await ctx.send("⏭️ Saltando canción...")
+        await asyncio.sleep(1.5)
+        await music_queue.cancel_disconnect_timer(ctx.guild.id)  # <-- añadido
         voice_client.stop()
-        await ctx.send("⏭️ Canción saltada")
-        await play_next(ctx.guild.id)
     else:
-        await ctx.send("❌ No hay música reproduciéndose")
+        if queue:
+            await ctx.send("⏭️ Saltando a la siguiente canción...")
+            await music_queue.cancel_disconnect_timer(ctx.guild.id)  # <-- añadido
+            await play_next(ctx.guild.id)
+        else:
+            await ctx.send("❌ No hay música reproduciéndose")
+
 
 @bot.command(name="stop")
 async def stop(ctx):
     """Detiene la música y limpia la cola"""
     voice_client = ctx.voice_client
     if voice_client:
-        # Limpiar la cola y la canción actual
-        if ctx.guild.id in music_queues:
-            music_queues[ctx.guild.id].clear()
-        if ctx.guild.id in current_playing:
-            del current_playing[ctx.guild.id]
-        
-        # Detener la reproducción y desconectar
+        # Verificación adicional antes de detener
+        queue = await music_queue.safe_get_queue(ctx.guild.id)
+        if queue:
+            await ctx.send("⚠️ Hay canciones en cola. Usa !skip para saltar o espera a que terminen.")
+            return
+            
+        music_queue.clear(ctx.guild.id)
+        await music_queue.cancel_disconnect_timer(ctx.guild.id)
         if voice_client.is_playing():
             voice_client.stop()
-        
         await voice_client.disconnect()
         await ctx.send("⏹️ Música detenida y bot desconectado")
     else:
         await ctx.send("❌ No estoy conectado a un canal de voz")
+
 
 @bot.command(name="queue", aliases=["q"])
 async def queue(ctx):
     """Muestra la cola de reproducción"""
     queue_list = []
     
-    # Canción actual
-    if ctx.guild.id in current_playing:
-        queue_list.append(f"**Reproduciendo ahora:**\n1. {current_playing[ctx.guild.id]['title']}")
+    if ctx.guild.id in music_queue.current:
+        loop_status = ""
+        loop_mode = music_queue.get_loop_mode(ctx.guild.id)
+        if loop_mode == 'song':
+            loop_status = " (🔂 Repitiendo esta canción)"
+        elif loop_mode == 'queue':
+            loop_status = " (🔁 Repitiendo toda la cola)"
+            
+        queue_list.append(f"**Reproduciendo ahora:**\n1. {music_queue.current[ctx.guild.id]['title']}{loop_status}")
     
-    # Canciones en cola
-    if ctx.guild.id in music_queues and music_queues[ctx.guild.id]:
+    queue = music_queue.get_queue(ctx.guild.id)
+    if queue:
         queue_list.append("\n**En cola:**")
-        for i, song in enumerate(list(music_queues[ctx.guild.id])[:10], start=2 if ctx.guild.id in current_playing else 1):
+        start = 2 if ctx.guild.id in music_queue.current else 1
+        for i, song in enumerate(list(queue)[:10], start=start):
             queue_list.append(f"{i}. {song['title']}")
     
-    if not queue_list:
-        return await ctx.send("❌ No hay música en la cola")
-    
-    await ctx.send("\n".join(queue_list))
+    await ctx.send("\n".join(queue_list) if queue_list else "❌ No hay música en la cola")
+
 
 @bot.command(name="quality")
 async def set_quality(ctx, quality: str = 'medium'):
@@ -320,10 +488,148 @@ async def resume(ctx):
 @bot.command(name="nowplaying", aliases=["np"])
 async def nowplaying(ctx):
     """Muestra la canción actual"""
-    if ctx.guild.id in current_playing:
-        await ctx.send(f"🎶 Reproduciendo ahora: {current_playing[ctx.guild.id]['title']}")
+    if ctx.guild.id in music_queue.current:
+        await ctx.send(f"🎶 Reproduciendo ahora: {music_queue.current[ctx.guild.id]['title']}")
     else:
-        await ctx.send("❌ No hay música reproduciéndose")
+        queue = await music_queue.safe_get_queue(ctx.guild.id)
+        if queue:
+            await ctx.send("⏸️ Hay música en cola pero no se está reproduciendo actualmente")
+        else:
+            await ctx.send("❌ No hay música reproduciéndose o en cola")
+
+@bot.command(name="loop", aliases=["repeat"])
+async def loop_command(ctx):
+    """Activa/desactiva el modo loop (canción/cola)"""
+    if not ctx.voice_client:
+        return await ctx.send("❌ No estoy conectado a un canal de voz")
+    
+    current_mode = music_queue.get_loop_mode(ctx.guild.id)
+    new_mode = music_queue.toggle_loop_mode(ctx.guild.id)
+    
+    modes = {
+        'none': '🔁 Loop desactivado',
+        'song': '🔂 Repitiendo canción actual',
+        'queue': '🔁 Repitiendo toda la cola'
+    }
+    
+    await ctx.send(f"{modes[new_mode]}")
+
+@bot.command(name="playlist", aliases=["pl"])
+async def playlist_command(ctx, action: str = None, *, name: str = None):
+    """Administra listas de reproducción. Subcomandos: save, load, list, delete"""
+    if not action:
+        return await ctx.send(
+            "📋 **Uso de listas de reproducción:**\n"
+            "`!playlist save <nombre>` - Guarda la cola actual como playlist\n"
+            "`!playlist load <nombre>` - Carga una playlist\n"
+            "`!playlist list` - Muestra tus playlists\n"
+            "`!playlist delete <nombre>` - Elimina una playlist"
+        )
+    
+    action = action.lower()
+    
+    if action == "save" and name:
+        if not ctx.voice_client or not music_queue.get_playing(ctx.guild.id):
+            return await ctx.send("❌ No hay música reproduciéndose para guardar")
+        
+        if len(name) > 30:
+            return await ctx.send("❌ El nombre de la playlist es demasiado largo (máx. 30 caracteres)")
+        
+        if await music_queue.save_playlist(ctx.guild.id, name):
+            await ctx.send(f"✅ Playlist guardada como **{name}**")
+        else:
+            await ctx.send("❌ No se pudo guardar la playlist (cola vacía)")
+    
+    elif action == "load" and name:
+        playlist = await music_queue.load_playlist(ctx.guild.id, name)
+        if not playlist:
+            return await ctx.send(f"❌ No se encontró la playlist **{name}**")
+        
+        if not ctx.author.voice:
+            return await ctx.send("🚨 Debes estar en un canal de voz para cargar una playlist!")
+        
+        voice_client = ctx.voice_client or await ctx.author.voice.channel.connect()
+        
+        # Añadir todas las canciones de la playlist
+        queue = await music_queue.safe_get_queue(ctx.guild.id)
+        for song in playlist:
+            queue.append(song)
+        
+        # Reproducir si no hay nada sonando
+        if not voice_client.is_playing() and not music_queue.get_playing(ctx.guild.id):
+            await play_next(ctx.guild.id)
+            await ctx.send(f"🎶 **Cargando playlist:** {name} ({len(playlist)} canciones)")
+        else:
+            await ctx.send(f"🎵 **Añadida playlist a la cola:** {name} ({len(playlist)} canciones)")
+    
+    elif action == "list":
+        playlists = music_queue.get_playlist_names(ctx.guild.id)
+        if not playlists:
+            return await ctx.send("❌ No hay playlists guardadas en este servidor")
+        
+        message = ["📋 **Playlists guardadas:**"]
+        for i, pl_name in enumerate(playlists, 1):
+            playlist = music_queue.playlists[ctx.guild.id][pl_name]
+            message.append(f"{i}. {pl_name} ({len(playlist)} canciones)")
+        
+        await ctx.send("\n".join(message))
+    
+    elif action == "delete" and name:
+        if music_queue.delete_playlist(ctx.guild.id, name):
+            await ctx.send(f"✅ Playlist **{name}** eliminada")
+        else:
+            await ctx.send(f"❌ No se encontró la playlist **{name}**")
+    
+    else:
+        await ctx.send("❌ Subcomando no válido. Usa `!playlist help` para ver opciones")
+
+@bot.command(name="history")
+async def history(ctx, cantidad: int = 5):
+    """Muestra las últimas canciones reproducidas (máx. 20)"""
+    if cantidad < 1 or cantidad > 20:
+        return await ctx.send("❌ Debes elegir un número entre 1 y 20.")
+
+    history_list = song_history.get(ctx.guild.id, [])
+    if not history_list:
+        return await ctx.send("📭 No hay historial disponible.")
+
+    history_slice = history_list[-cantidad:]
+    lines = [
+        f"{i+1}. {song['title']} — 🎧 solicitado por {song.get('requested_by', 'Desconocido')}"
+        for i, song in enumerate(reversed(history_slice))
+    ]
+    await ctx.send("📜 **Historial de canciones:**\n" + "\n".join(lines))
+
+
+@bot.command(name="replay")
+async def replay(ctx, indice: int):
+    """Vuelve a reproducir una canción del historial (!replay <número>)"""
+    history_list = song_history.get(ctx.guild.id, [])
+    if not history_list:
+        return await ctx.send("❌ No hay canciones en el historial.")
+
+    if indice < 1 or indice > min(10, len(history_list)):
+        return await ctx.send(f"❌ Índice inválido. Usa `!history` para ver el historial.")
+
+    # Obtener la canción desde el historial más reciente
+    song = list(reversed(history_list[-10:]))[indice - 1]
+
+    if not ctx.author.voice:
+        return await ctx.send("🚨 Debes estar en un canal de voz para usar este comando.")
+
+    voice_client = ctx.voice_client or await ctx.author.voice.channel.connect()
+    queue = await music_queue.safe_get_queue(ctx.guild.id)
+    queue.append(song)
+
+    if not voice_client.is_playing() and not music_queue.get_playing(ctx.guild.id):
+        await play_next(ctx.guild.id)
+        await ctx.send(f"▶️ Reproduciendo nuevamente: **{song['title']}** (solicitado por {song.get('requested_by', 'Desconocido')})")
+    else:
+        await ctx.send(f"🎵 Añadida a la cola: **{song['title']}** (solicitado por {song.get('requested_by', 'Desconocido')})")
+
+
+
+
 
 @bot.command()
 async def latency(ctx):
@@ -335,8 +641,8 @@ async def latency(ctx):
     if ctx.voice_client:
         content += f" | Voz: {int(ctx.voice_client.latency*1000)}ms"
     await message.edit(content=content)
-    
-    
+
+
 # Constantes de configuración
 STAFF_ROLES = [1380930376343752704, 1380930523668549703, 1380930573899665538, 1380930606191607949]
 LOG_CHANNEL_ID = 1381026786368032819
@@ -362,26 +668,26 @@ CREATE TABLE IF NOT EXISTS infracciones (
 conn.commit()
 
 # Funciones de utilidad
-async def agregar_infraccion(user_id: int, guild_id: int, motivo: str):
-    cursor.execute('''
+async def add_infraction(user_id: int, guild_id: int, reason: str):
+    db_cursor.execute('''
     INSERT INTO infracciones (user_id, guild_id, motivo, fecha)
     VALUES (?, ?, ?, ?)
-    ''', (user_id, guild_id, motivo, datetime.now().isoformat()))
-    conn.commit()
+    ''', (user_id, guild_id, reason, datetime.now().isoformat()))
+    db_conn.commit()
 
-async def obtener_infracciones(user_id: int, guild_id: int) -> int:
-    cursor.execute('''
+async def get_infractions(user_id: int, guild_id: int) -> int:
+    db_cursor.execute('''
     SELECT COUNT(*) FROM infracciones 
     WHERE user_id = ? AND guild_id = ?
     ''', (user_id, guild_id))
-    return cursor.fetchone()[0]
+    return db_cursor.fetchone()[0]
 
-async def limpiar_infracciones(user_id: int, guild_id: int):
-    cursor.execute('''
+async def clear_infractions(user_id: int, guild_id: int):
+    db_cursor.execute('''
     DELETE FROM infracciones 
     WHERE user_id = ? AND guild_id = ?
     ''', (user_id, guild_id))
-    conn.commit()
+    db_conn.commit()
 
 async def is_staff(member: discord.Member) -> bool:
     return any(role.id in STAFF_ROLES for role in member.roles)
@@ -494,192 +800,230 @@ class TicketModal(ui.Modal, title="Nuevo Ticket"):
         
         await interaction.response.send_message(f"✅ Ticket creado en {ticket_channel.mention}", ephemeral=True)
 
-# Panel de Moderación
-class ModPanelView(ui.View):
-    def __init__(self, author_id: int):
-        super().__init__(timeout=None)
-        self.author_id = author_id
+# --------------------------
+# Comandos de Moderación Mejorados
+# --------------------------
+
+@bot.tree.command(name="advertir", description="Envía una advertencia a un usuario")
+@app_commands.describe(
+    usuario="Usuario a advertir",
+    motivo="Motivo de la advertencia"
+)
+@app_commands.default_permissions(manage_messages=True)
+async def advertir(interaction: discord.Interaction, usuario: discord.Member, motivo: str):
+    """Sistema de advertencias mejorado con registro en DB y notificaciones"""
+    if not await is_staff(interaction.user):
+        return await interaction.response.send_message("❌ No tienes permisos para usar este comando.", ephemeral=True)
     
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.author_id or not await is_staff(interaction.user):
-            await interaction.response.send_message("❌ No tienes permiso para usar este panel.", ephemeral=True)
-            return False
-        return True
+    if usuario.top_role.position >= interaction.user.top_role.position:
+        return await interaction.response.send_message("❌ No puedes advertir a alguien con igual o mayor rango.", ephemeral=True)
     
-    @ui.button(label="⚠️ Advertencia", style=discord.ButtonStyle.grey, custom_id="mod:warn")
-    async def warn_button(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.send_modal(WarnModal())
+    # Registrar infracción
+    await add_infraction(usuario.id, interaction.guild.id, motivo)
+    total = await get_infractions(usuario.id, interaction.guild.id)
     
-    @ui.button(label="🔇 Mute", style=discord.ButtonStyle.blurple, custom_id="mod:mute")
-    async def mute_button(self, interaction: discord.Interaction, button: ui.Button):
-        view = ui.View()
-        view.add_item(MuteUserDropdown())
-        await interaction.response.send_message(
-            "Selecciona un usuario para mutear:",
-            view=view,
-            ephemeral=True
+    # Crear embed de respuesta
+    embed = discord.Embed(
+        title="⚠️ Advertencia Registrada",
+        description=f"**Usuario:** {usuario.mention}\n**Moderador:** {interaction.user.mention}",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="Motivo", value=motivo, inline=False)
+    embed.add_field(name="Advertencias totales", value=f"{total}/{MAX_ADVERTENCIAS}", inline=True)
+    
+    if total >= ALERTA_ADVERTENCIAS:
+        embed.color = discord.Color.orange()
+        embed.set_footer(text=f"¡Alerta! Este usuario tiene {total} advertencias")
+    
+    await interaction.response.send_message(embed=embed)
+    
+    # Notificar al usuario
+    try:
+        user_embed = discord.Embed(
+            title=f"⚠️ Has recibido una advertencia en {interaction.guild.name}",
+            description=f"**Motivo:** {motivo}\n**Advertencias totales:** {total}",
+            color=discord.Color.gold()
+        )
+        await usuario.send(embed=user_embed)
+    except discord.HTTPException:
+        pass
+
+@bot.tree.command(name="mutear", description="Silencia a un usuario por un tiempo determinado")
+@app_commands.describe(
+    usuario="Usuario a mutear",
+    duracion="Duración del mute",
+    motivo="Motivo del mute (opcional)"
+)
+@app_commands.choices(duracion=[
+    app_commands.Choice(name="5 minutos", value="300"),
+    app_commands.Choice(name="1 hora", value="3600"),
+    app_commands.Choice(name="1 día", value="86400"),
+    app_commands.Choice(name="1 semana", value="604800")
+])
+@app_commands.default_permissions(manage_messages=True)
+async def mutear(interaction: discord.Interaction, usuario: discord.Member, 
+                duracion: app_commands.Choice[str], motivo: str = "No especificado"):
+    """Sistema de muteo con temporizador automático"""
+    if not await is_staff(interaction.user):
+        return await interaction.response.send_message("❌ No tienes permisos para usar este comando.", ephemeral=True)
+    
+    if usuario.top_role.position >= interaction.user.top_role.position:
+        return await interaction.response.send_message("❌ No puedes mutear a alguien con igual o mayor rango.", ephemeral=True)
+    
+    mute_role = discord.utils.get(interaction.guild.roles, name=MUTE_ROLE_NAME)
+    if not mute_role:
+        return await interaction.response.send_message(f"❌ No existe el rol '{MUTE_ROLE_NAME}'.", ephemeral=True)
+    
+    try:
+        # Aplicar mute
+        await usuario.add_roles(mute_role, reason=motivo)
+        
+        # Crear embed de respuesta
+        embed = discord.Embed(
+            title="🔇 Usuario muteado",
+            description=f"**Usuario:** {usuario.mention}\n**Moderador:** {interaction.user.mention}",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Duración", value=duracion.name, inline=True)
+        embed.add_field(name="Motivo", value=motivo, inline=True)
+        
+        await interaction.response.send_message(embed=embed)
+        
+        # Notificar al usuario
+        try:
+            user_embed = discord.Embed(
+                title=f"🔇 Has sido muteado en {interaction.guild.name}",
+                description=f"**Duración:** {duracion.name}\n**Motivo:** {motivo}",
+                color=discord.Color.blue()
+            )
+            await usuario.send(embed=user_embed)
+        except discord.HTTPException:
+            pass
+        
+        # Temporizador para auto-desmutear
+        await asyncio.sleep(int(duracion.value))
+        if mute_role in usuario.roles:
+            await usuario.remove_roles(mute_role)
+            
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error al mutear: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="banear", description="Expulsa permanentemente a un usuario del servidor")
+@app_commands.describe(
+    usuario="Usuario a banear",
+    motivo="Motivo del ban (opcional)",
+    borrar_mensajes="Días de mensajes a borrar (0-7)"
+)
+@app_commands.default_permissions(ban_members=True)
+async def banear(interaction: discord.Interaction, usuario: discord.Member, 
+                motivo: str = "No especificado", borrar_mensajes: int = 0):
+    """Sistema de ban mejorado con opción de purga de mensajes"""
+    if not await is_staff(interaction.user):
+        return await interaction.response.send_message("❌ No tienes permisos para usar este comando.", ephemeral=True)
+    
+    if usuario.top_role.position >= interaction.user.top_role.position:
+        return await interaction.response.send_message("❌ No puedes banear a alguien con igual o mayor rango.", ephemeral=True)
+    
+    borrar_mensajes = min(7, max(0, borrar_mensajes))
+    
+    try:
+        await usuario.ban(reason=motivo, delete_message_days=borrar_mensajes)
+        
+        embed = discord.Embed(
+            title="🔨 Usuario baneado",
+            description=f"**Usuario:** {usuario.mention}\n**Moderador:** {interaction.user.mention}",
+            color=discord.Color.red()
+        )
+        embed.add_field(name="Motivo", value=motivo, inline=True)
+        embed.add_field(name="Mensajes borrados", value=f"{borrar_mensajes} días", inline=True)
+        
+        await interaction.response.send_message(embed=embed)
+        
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error al banear: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="desmutear", description="Remueve el mute de un usuario")
+@app_commands.describe(usuario="Usuario a desmutear")
+@app_commands.default_permissions(manage_messages=True)
+async def desmutear(interaction: discord.Interaction, usuario: discord.Member):
+    """Comando para remover mute de un usuario"""
+    if not await is_staff(interaction.user):
+        return await interaction.response.send_message("❌ No tienes permisos para usar este comando.", ephemeral=True)
+    
+    mute_role = discord.utils.get(interaction.guild.roles, name=MUTE_ROLE_NAME)
+    if not mute_role:
+        return await interaction.response.send_message(f"❌ No existe el rol '{MUTE_ROLE_NAME}'.", ephemeral=True)
+    
+    if mute_role not in usuario.roles:
+        return await interaction.response.send_message(f"❌ {usuario.mention} no está muteado.", ephemeral=True)
+    
+    try:
+        await usuario.remove_roles(mute_role)
+        
+        embed = discord.Embed(
+            title="🔊 Usuario desmuteado",
+            description=f"**Usuario:** {usuario.mention}\n**Moderador:** {interaction.user.mention}",
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed)
+        
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error al desmutear: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="infracciones", description="Muestra las infracciones de un usuario")
+@app_commands.describe(usuario="Usuario a consultar")
+@app_commands.default_permissions(manage_messages=True)
+async def infracciones(interaction: discord.Interaction, usuario: discord.Member):
+    """Sistema de consulta de infracciones con paginación"""
+    if not await is_staff(interaction.user):
+        return await interaction.response.send_message("❌ No tienes permisos para usar este comando.", ephemeral=True)
+    
+    total = await get_infractions(usuario.id, interaction.guild.id)
+    db_cursor.execute('''
+    SELECT motivo, fecha FROM infracciones 
+    WHERE user_id = ? AND guild_id = ?
+    ORDER BY fecha DESC LIMIT 5
+    ''', (usuario.id, interaction.guild.id))
+    infracciones = db_cursor.fetchall()
+    
+    embed = discord.Embed(
+        title=f"📝 Infracciones de {usuario.display_name}",
+        description=f"Total: **{total}** infracciones",
+        color=discord.Color.orange()
+    )
+    
+    for i, (motivo, fecha) in enumerate(infracciones, 1):
+        fecha_obj = datetime.fromisoformat(fecha)
+        embed.add_field(
+            name=f"Infracción #{i} - {fecha_obj.strftime('%d/%m/%Y')}",
+            value=f"**Motivo:** {motivo}",
+            inline=False
         )
     
-    @ui.button(label="🔨 Ban", style=discord.ButtonStyle.red, custom_id="mod:ban")
-    async def ban_button(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.send_modal(BanModal())
+    if total > 5:
+        embed.set_footer(text=f"Mostrando las 5 más recientes de {total} infracciones")
     
-    @ui.button(label="🧹 Limpiar", style=discord.ButtonStyle.green, custom_id="mod:clear")
-    async def clear_button(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.send_modal(ClearModal())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="limpiar_infracciones", description="Borra todas las infracciones de un usuario")
+@app_commands.describe(usuario="Usuario a limpiar")
+@app_commands.default_permissions(manage_messages=True)
+async def limpiar_infracciones(interaction: discord.Interaction, usuario: discord.Member):
+    """Comando para resetear el historial de infracciones de un usuario"""
+    if not await is_staff(interaction.user):
+        return await interaction.response.send_message("❌ No tienes permisos para usar este comando.", ephemeral=True)
     
-    @ui.button(label="🔊 Desmutear", style=discord.ButtonStyle.blurple, custom_id="mod:unmute")
-    async def unmute_button(self, interaction: discord.Interaction, button: ui.Button):
-        view = ui.View()
-        view.add_item(UnmuteUserDropdown())
-        await interaction.response.send_message(
-            "Selecciona un usuario para desmutear:",
-            view=view,
-            ephemeral=True
-        )
-
-# Componentes de moderación
-class MuteUserDropdown(ui.UserSelect):
-    def __init__(self):
-        super().__init__(placeholder="Selecciona un usuario...", custom_id="mod:mute_user")
-
-    async def callback(self, interaction: discord.Interaction):
-        view = ui.View()
-        view.add_item(MuteDurationDropdown(self.values[0].id))
-        await interaction.response.edit_message(
-            content=f"Selecciona duración para {self.values[0].mention}:",
-            view=view
-        )
-
-class MuteDurationDropdown(ui.Select):
-    def __init__(self, user_id: int):
-        options = [
-            discord.SelectOption(label="5 minutos", value="300"),
-            discord.SelectOption(label="1 hora", value="3600"),
-            discord.SelectOption(label="1 día", value="86400"),
-            discord.SelectOption(label="1 semana", value="604800")
-        ]
-        super().__init__(
-            placeholder="Selecciona duración...",
-            custom_id=f"mod:mute_duration:{user_id}",
-            options=options
-        )
-        self.user_id = user_id
-
-    async def callback(self, interaction: discord.Interaction):
-        user = interaction.guild.get_member(self.user_id)
-        if not user:
-            return await interaction.response.send_message("❌ Usuario no encontrado.", ephemeral=True)
-        
-        mute_role = discord.utils.get(interaction.guild.roles, name=MUTE_ROLE_NAME)
-        if not mute_role:
-            return await interaction.response.send_message(f"❌ No hay un rol '{MUTE_ROLE_NAME}' configurado.", ephemeral=True)
-        
-        try:
-            await user.add_roles(mute_role)
-            duration = int(self.values[0])
-            
-            embed = discord.Embed(
-                title="🔇 Usuario muteado",
-                description=f"**Usuario:** {user.mention}\n**Duración:** {self.options[0].label}",
-                color=0x7289da
-            )
-            await interaction.response.send_message(embed=embed)
-            
-            await asyncio.sleep(duration)
-            await user.remove_roles(mute_role)
-            
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
-
-class UnmuteUserDropdown(ui.UserSelect):
-    def __init__(self):
-        super().__init__(placeholder="Selecciona un usuario...", custom_id="mod:unmute_user")
-
-    async def callback(self, interaction: discord.Interaction):
-        user = self.values[0]
-        mute_role = discord.utils.get(interaction.guild.roles, name=MUTE_ROLE_NAME)
-        
-        if not mute_role:
-            return await interaction.response.send_message(f"❌ No hay un rol '{MUTE_ROLE_NAME}' configurado.", ephemeral=True)
-        
-        if mute_role not in user.roles:
-            return await interaction.response.send_message(f"❌ {user.mention} no está muteado.", ephemeral=True)
-        
-        try:
-            await user.remove_roles(mute_role)
-            embed = discord.Embed(
-                title="🔊 Usuario desmuteado",
-                description=f"Se ha removido el mute de {user.mention}",
-                color=0x00ff00
-            )
-            await interaction.response.send_message(embed=embed)
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
-
-# Modales de moderación
-class WarnModal(ui.Modal, title="Advertencia"):
-    user = ui.TextInput(label="ID o Mención del Usuario", custom_id="warn_user")
-    reason = ui.TextInput(label="Motivo", style=discord.TextStyle.paragraph, custom_id="warn_reason")
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            user = await commands.MemberConverter().convert(interaction, self.user.value)
-            await agregar_infraccion(user.id, interaction.guild.id, self.reason.value)
-            
-            embed = discord.Embed(
-                title="⚠️ Advertencia Registrada",
-                description=f"**Usuario:** {user.mention}\n**Motivo:** {self.reason.value}",
-                color=0xffcc00
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            
-            try:
-                await user.send(f"⚠️ Has recibido una advertencia en **{interaction.guild.name}**:\n**Motivo:** {self.reason.value}")
-            except discord.HTTPException:
-                pass
-            
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
-
-class BanModal(ui.Modal, title="Banear Usuario"):
-    user = ui.TextInput(label="ID o Mención del Usuario", custom_id="ban_user")
-    reason = ui.TextInput(label="Motivo", style=discord.TextStyle.paragraph, custom_id="ban_reason")
-    delete_days = ui.TextInput(label="Borrar mensajes (0-7 días)", default="0", required=False, custom_id="ban_days")
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            user = await commands.MemberConverter().convert(interaction, self.user.value)
-            delete_days = min(7, max(0, int(self.delete_days.value or "0")))
-            
-            await user.ban(
-                reason=self.reason.value,
-                delete_message_days=delete_days
-            )
-            
-            embed = discord.Embed(
-                title="🔨 Usuario baneado",
-                description=f"**Usuario:** {user.mention}\n**Motivo:** {self.reason.value}\n**Mensajes borrados:** {delete_days} días",
-                color=0xff0000
-            )
-            await interaction.response.send_message(embed=embed)
-            
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
-
-class ClearModal(ui.Modal, title="Limpiar Mensajes"):
-    cantidad = ui.TextInput(label="Número de mensajes (1-100)", custom_id="clear_amount")
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            amount = min(100, max(1, int(self.cantidad.value)))
-            await interaction.channel.purge(limit=amount)
-            await interaction.response.send_message(
-                f"🧹 Se borraron {amount} mensajes.",
-                ephemeral=True
-            )
-        except ValueError:
-            await interaction.response.send_message("❌ Por favor ingresa un número válido.", ephemeral=True)
+    if usuario.top_role.position >= interaction.user.top_role.position:
+        return await interaction.response.send_message("❌ No puedes limpiar infracciones de alguien con igual o mayor rango.", ephemeral=True)
+    
+    await clear_infractions(usuario.id, interaction.guild.id)
+    
+    embed = discord.Embed(
+        title="🧹 Infracciones limpiadas",
+        description=f"Se han eliminado todas las infracciones de {usuario.mention}",
+        color=discord.Color.green()
+    )
+    await interaction.response.send_message(embed=embed)
 
 # Comandos de aplicación
 @bot.tree.command(name="ticket", description="Crea un nuevo ticket de soporte")
@@ -699,7 +1043,6 @@ async def modpanel(interaction: discord.Interaction):
     )
     await interaction.response.send_message(
         embed=embed, 
-        view=ModPanelView(interaction.user.id),
         ephemeral=True
     )
 
@@ -724,80 +1067,126 @@ async def limpiar(interaction: discord.Interaction, cantidad: int):
         ephemeral=True
     )
 
-@bot.tree.command(name="desmutear", description="Remueve el mute de un usuario")
-@app_commands.describe(usuario="Usuario a desmutear")
-@app_commands.default_permissions(manage_messages=True)
-async def desmutear(interaction: discord.Interaction, usuario: discord.Member):
-    if not await is_staff(interaction.user):
-        return await interaction.response.send_message("❌ Solo el staff puede usar este comando.", ephemeral=True)
-    
-    mute_role = discord.utils.get(interaction.guild.roles, name=MUTE_ROLE_NAME)
-    if not mute_role:
-        return await interaction.response.send_message(f"❌ No hay un rol '{MUTE_ROLE_NAME}' configurado.", ephemeral=True)
-    
-    if mute_role not in usuario.roles:
-        return await interaction.response.send_message(f"❌ {usuario.mention} no está muteado.", ephemeral=True)
-    
+
+
+async def post_music_commands():
+    channel = bot.get_channel(MUSIC_COMMANDS_CHANNEL_ID)
+    if not channel:
+        print("❌ Canal de comandos musicales no encontrado.")
+        return
+
+    # Verifica si ya existe el mensaje fijado
+    pinned = await channel.pins()
+    for msg in pinned:
+        if msg.author == bot.user and "¡Comandos de Música" in (msg.embeds[0].title if msg.embeds else msg.content):
+            return  # Ya está fijado
+
+    embed = discord.Embed(
+        title="🎧 ¡Comandos de Música Disponibles!",
+        description="Aquí tienes todo lo que puedes hacer con el bot musical:",
+        color=discord.Color.purple()
+    )
+
+    embed.add_field(
+        name="🎵 Reproducción Básica",
+        value=(
+            "`!play <nombre o link>` — Reproduce o agrega una canción\n"
+            "`!skip` — Salta la canción actual\n"
+            "`!stop` — Detiene la música y desconecta\n"
+            "`!pause` — Pausa la canción\n"
+            "`!resume` — Reanuda la reproducción"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📃 Información",
+        value=(
+            "`!queue` — Muestra la cola de reproducción\n"
+            "`!nowplaying` / `!np` — Muestra la canción actual"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🔁 Repetición",
+        value=(
+            "`!loop` / `!repeat` — Alterna entre repetir canción, cola o desactivar"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📂 Playlists",
+        value=(
+            "`!playlist save <nombre>` — Guarda la cola actual\n"
+            "`!playlist load <nombre>` — Carga una playlist\n"
+            "`!playlist list` — Muestra tus playlists\n"
+            "`!playlist delete <nombre>` — Elimina una playlist"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🔊 Audio",
+        value="`!quality <low|medium|high>` — Cambia la calidad del sonido",
+        inline=False
+    )
+
+    embed.add_field(
+        name="🕘 Historial",
+        value=(
+            "`!history [número]` — Muestra las últimas canciones (máx. 10)\n"
+            "`!replay <número>` — Vuelve a reproducir una canción del historial"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📡 Diagnóstico",
+        value="`!latency` — Mide la latencia del bot y la voz",
+        inline=False
+    )
+
+    embed.set_footer(text="💡 Usa !p como atajo para !play | El bot se desconecta tras 60s de inactividad.")
+    embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/727/727240.png")  # Ícono opcional
+
     try:
-        await usuario.remove_roles(mute_role)
-        embed = discord.Embed(
-            title="🔊 Usuario desmuteado",
-            description=f"Se ha removido el mute de {usuario.mention}",
-            color=0x00ff00
-        )
-        await interaction.response.send_message(embed=embed)
+        msg = await channel.send(embed=embed)
+        await msg.pin()
     except Exception as e:
-        await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
+        print(f"❌ Error al enviar o fijar el embed: {e}")
 
 
+
+# --------------------------
 # Eventos
+# --------------------------
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    # Reconectar automáticamente si el bot es desconectado
-    if member == bot.user and before.channel and not after.channel:
-        try:
-            await asyncio.sleep(2)
-            await before.channel.connect()
-            if before.channel.guild.id in music_queues and music_queues[before.channel.guild.id]:
-                voice = discord.utils.get(bot.voice_clients, guild=before.channel.guild)
-                if voice and not voice.is_playing():
-                    await play_next(before.channel.guild, voice)
-        except Exception as e:
-            print(f"Error al reconectar: {e}")
-
-
-@bot.event
-async def on_voice_state_update(member, before, after):
-    # Solo manejar cambios de estado del propio bot
     if member != bot.user:
         return
     
-    # Si el bot fue desconectado forzosamente
     if before.channel and not after.channel:
-        guild_id = before.channel.guild.id
-        if guild_id in music_queues:
-            music_queues[guild_id].clear()
-        if guild_id in current_playing:
-            del current_playing[guild_id]
-    
-    # Si el bot fue movido a otro canal
+        music_queue.clear(before.channel.guild.id)
+        await music_queue.cancel_disconnect_timer(before.channel.guild.id)
     elif before.channel and after.channel and before.channel != after.channel:
-        # Notificar sobre el movimiento
-        channel = after.channel
-        await channel.send(f"🔊 Me han movido a este canal de voz")
+        await after.channel.send("🔊 Me han movido a este canal de voz")
 
 @bot.event
 async def on_ready():
     bot.add_view(TicketView())
-    bot.add_view(ModPanelView(author_id=0))
     await bot.tree.sync()
     print(f"✅ Bot listo como {bot.user}")
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.listening,
         name="!help"
     ))
+    await post_music_commands()
 
+# --------------------------
+# Ejecución del Bot
+# --------------------------
 
-# Ejecutar el bot
 bot.run(os.getenv("TOKEN"))
