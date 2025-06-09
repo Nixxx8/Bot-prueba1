@@ -56,14 +56,26 @@ FFMPEG_OPTIONS = {
 }
 
 AUDIO_QUALITIES = {
-    'low': {'bitrate': '64k', 'options': '-vn -af "volume=0.9"'},
-    'medium': {'bitrate': '128k', 'options': '-vn -af "dynaudnorm=f=150:g=15"'},
-    'high': {'bitrate': '192k', 'options': '-vn -ar 48000 -ac 2 -af "dynaudnorm=f=150:g=15"'}
+    'low': {
+        'bitrate': '64k',
+        'options': '-vn -af "volume=0.9"'
+    },
+    'medium': {
+        'bitrate': '128k',
+        'options': '-vn -af "dynaudnorm=g=8:f=250,alimiter=limit=0.9"'
+    },
+    'high': {
+        'bitrate': '192k',
+        'options': '-vn -ar 48000 -ac 2 -af "dynaudnorm=g=8:f=250,alimiter=limit=0.9"'
+    }
 }
+
+FFMPEG_OPTIONS['options'] = AUDIO_QUALITIES['high']['options']
 
 # --------------------------
 # Base de Datos
 # --------------------------
+
 
 def setup_database():
     conn = sqlite3.connect('moderacion.db')
@@ -78,8 +90,23 @@ def setup_database():
         PRIMARY KEY (user_id, guild_id, fecha)
     )
     ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS playlists (
+    guild_id INTEGER,
+    name TEXT,
+    song_index INTEGER,
+    title TEXT,
+    url TEXT,
+    duration INTEGER,
+    requested_by TEXT,
+    PRIMARY KEY (guild_id, name, song_index)
+)
+''')
+
     conn.commit()
     return conn, cursor
+
 
 db_conn, db_cursor = setup_database()
 song_history: Dict[int, List[Dict]] = {}
@@ -162,36 +189,6 @@ class MusicQueue:
         self.set_loop_mode(guild_id, modes[next_index])
         return modes[next_index]
     
-    async def save_playlist(self, guild_id: int, name: str):
-        if guild_id not in self.playlists:
-            self.playlists[guild_id] = {}
-        
-        queue = await self.safe_get_queue(guild_id)
-        current = self.current.get(guild_id, None)
-        
-        songs = []
-        if current:
-            songs.append(current)
-        songs.extend(list(queue))
-        
-        if songs:
-            self.playlists[guild_id][name] = songs
-            return True
-        return False
-    
-    async def load_playlist(self, guild_id: int, name: str) -> Optional[List[Dict]]:
-        if guild_id not in self.playlists or name not in self.playlists[guild_id]:
-            return None
-        return self.playlists[guild_id][name]
-    
-    def get_playlist_names(self, guild_id: int) -> List[str]:
-        return list(self.playlists.get(guild_id, {}).keys())
-    
-    def delete_playlist(self, guild_id: int, name: str) -> bool:
-        if guild_id in self.playlists and name in self.playlists[guild_id]:
-            del self.playlists[guild_id][name]
-            return True
-        return False
     
     def is_autoplay(self, guild_id: int) -> bool:
         return self.autoplay_enabled.get(guild_id, False)
@@ -199,6 +196,74 @@ class MusicQueue:
     def set_autoplay(self, guild_id: int, enabled: bool):
         self.autoplay_enabled[guild_id] = enabled
 
+async def save_playlist(self, guild_id: int, name: str):
+    queue = await self.safe_get_queue(guild_id)
+    current = self.current.get(guild_id)
+
+    songs = []
+    if current:
+        songs.append(current)
+    songs.extend(list(queue))
+
+    if not songs:
+        return False
+
+    # Eliminar playlist existente con el mismo nombre
+    db_cursor.execute(
+        "DELETE FROM playlists WHERE guild_id = ? AND name = ?",
+        (guild_id, name)
+    )
+
+    for i, song in enumerate(songs):
+        db_cursor.execute(
+            '''INSERT INTO playlists 
+            (guild_id, name, song_index, title, url, duration, requested_by) 
+            VALUES (?, ?, ?, ?, ?, ?, ?)''',
+            (
+                guild_id, name, i,
+                song.get("title", "Sin título"),
+                song.get("url", ""),
+                song.get("duration", 0),
+                song.get("requested_by", "Desconocido")
+            )
+        )
+    db_conn.commit()
+    return True
+
+async def load_playlist(self, guild_id: int, name: str):
+    db_cursor.execute(
+        '''SELECT title, url, duration, requested_by 
+        FROM playlists 
+        WHERE guild_id = ? AND name = ? 
+        ORDER BY song_index ASC''',
+        (guild_id, name)
+    )
+    rows = db_cursor.fetchall()
+    if not rows:
+        return None
+    return [
+        {
+            "title": r[0],
+            "url": r[1],
+            "duration": r[2],
+            "requested_by": r[3]
+        } for r in rows
+    ]
+
+def get_playlist_names(self, guild_id: int) -> List[str]:
+    db_cursor.execute(
+        '''SELECT DISTINCT name FROM playlists WHERE guild_id = ?''',
+        (guild_id,)
+    )
+    return [r[0] for r in db_cursor.fetchall()]
+
+def delete_playlist(self, guild_id: int, name: str) -> bool:
+    db_cursor.execute(
+        '''DELETE FROM playlists WHERE guild_id = ? AND name = ?''',
+        (guild_id, name)
+    )
+    db_conn.commit()
+    return db_cursor.rowcount > 0
 
 
 
@@ -1117,7 +1182,7 @@ async def limpiar(interaction: discord.Interaction, cantidad: int):
 
 
 
-async def post_music_commands():
+#async def post_music_commands():
     channel = bot.get_channel(MUSIC_COMMANDS_CHANNEL_ID)
     if not channel:
         print("❌ Canal de comandos musicales no encontrado.")
@@ -1245,9 +1310,9 @@ async def on_ready():
     print(f"✅ Bot listo como {bot.user}")
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.listening,
-        name="!help"
+        name="a tu mami"
     ))
-    await post_music_commands()
+    #await post_music_commands()
 
 # --------------------------
 # Ejecución del Bot
